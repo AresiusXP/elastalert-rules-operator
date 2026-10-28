@@ -1,0 +1,13 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "elastalert-rules-operator.fullname" . }}
+  labels:
+    {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "elastalert-rules-operator.selectorLabels" . | nindent 6 }}
+{{- end }}

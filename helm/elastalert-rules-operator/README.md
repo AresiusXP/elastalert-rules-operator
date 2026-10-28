@@ -9,13 +9,13 @@ A Kubernetes operator for managing ElastAlert rules via Custom Resource Definiti
 
 ## Overview
 
-This Helm chart deploys the ElastAlert Rules Operator, which allows you to manage ElastAlert rules as Kubernetes custom resources. The operator watches for `ElastAlertRule` CRs and automatically writes them to ConfigMaps that can be consumed by ElastAlert.
+This Helm chart deploys the ElastAlert Rules Operator, which allows you to manage ElastAlert rules as Kubernetes custom resources. The operator watches for `ElastAlertRule` CRs and writes them to ConfigMaps or Secrets that ElastAlert consumes. It only writes to the targets you list in the `targets` value, and the RBAC it gets is generated for exactly those objects.
 
 ## Prerequisites
 
 - Kubernetes 1.25+
 - Helm 3.8+
-- Pre-created ConfigMaps for storing ElastAlert rules (see Usage section)
+- Pre-created ConfigMaps (or Secrets) for storing ElastAlert rules, listed in the `targets` value
 
 ## Installation
 
@@ -26,7 +26,9 @@ helm install elastalert-rules-operator \
   oci://ghcr.io/aresiusxp/charts/elastalert-rules-operator \
   --version 0.6.0 \
   --namespace elastalert-rules-operator-system \
-  --create-namespace
+  --create-namespace \
+  --set 'targets[0].name=elastalert-rules' \
+  --set 'targets[0].namespace=monitoring'
 ```
 
 ### Install from Local Chart
@@ -34,8 +36,12 @@ helm install elastalert-rules-operator \
 ```bash
 helm install elastalert-rules-operator ./helm/elastalert-rules-operator \
   --namespace elastalert-rules-operator-system \
-  --create-namespace
+  --create-namespace \
+  --set 'targets[0].name=elastalert-rules' \
+  --set 'targets[0].namespace=monitoring'
 ```
+
+Without `targets[].namespace` the target is looked up in the release namespace. Helm does not upgrade CRDs: apply `crds/` yourself when upgrading across versions.
 
 ## Configuration
 
@@ -47,9 +53,20 @@ helm install elastalert-rules-operator ./helm/elastalert-rules-operator \
 | `image.repository` | Operator image repository | `ghcr.io/aresiusxp/elastalert-rules-operator` |
 | `image.tag` | Operator image tag | Chart appVersion |
 | `resources.limits.cpu` | CPU limit | `500m` |
-| `resources.limits.memory` | Memory limit | `128Mi` |
+| `resources.limits.memory` | Memory limit | `256Mi` |
 | `resources.requests.cpu` | CPU request | `10m` |
 | `resources.requests.memory` | Memory request | `64Mi` |
+| `targets` | ConfigMaps and Secrets rules may write to (`name`, `namespace`, `kind`) | `[{name: elastalert-rules, kind: ConfigMap}]` |
+| `policy.allowedAlerters` | Alerters rules may use | opsgenie, post, slack, msteams, email, alertmanager, debug |
+| `policy.allowedAdditionalFields` | Extra settings `additionalFields` and `secretRefs` may use | `[]` |
+| `policy.allowedIndexPatterns` | Glob patterns of indices rules may query (empty: any) | `[]` |
+| `policy.allowedHttpHosts` | Hosts HTTP POST alerters may use (empty: any) | `[]` |
+| `secretRefs.enabled` | Let rules read labelled Secrets (grants cluster-wide Secret `get`) | `false` |
+| `metrics.enabled` | Serve authenticated HTTPS metrics, create a Service | `false` |
+| `metrics.readerSubjects` | Subjects bound to the `/metrics` reader ClusterRole (for example the Prometheus ServiceAccount) | `[]` |
+| `metrics.serviceMonitor.enabled` | Create a Prometheus Operator ServiceMonitor | `false` |
+| `networkPolicy.enabled` | Restrict ingress and egress of the operator pod | `false` |
+| `podDisruptionBudget.enabled` | Create a PodDisruptionBudget | `false` |
 | `rbac.create` | Create RBAC resources | `true` |
 | `serviceAccount.create` | Create ServiceAccount | `true` |
 
@@ -64,13 +81,13 @@ elastalert:
   deploymentNamespace: "monitoring"
 ```
 
-When enabled, the operator will update the ElastAlert deployment's pod template annotation when rule checksums change, triggering a rolling update.
+When enabled, the operator patches the ElastAlert deployment's pod template annotation when the target changes, triggering a rolling update. Its permission is limited to `get` and `patch` on that one Deployment.
 
 ## Usage
 
 ### Creating the Target ConfigMap
 
-**Important**: Before creating ElastAlertRules, you must first create the target ConfigMap. The operator will not automatically create ConfigMaps.
+**Important**: Before creating ElastAlertRules, you must first create the target ConfigMap. The operator never creates targets, and refuses targets that are not in the `targets` value.
 
 ```bash
 kubectl create namespace monitoring
@@ -104,7 +121,7 @@ spec:
 
 ### Specifying Target ConfigMap
 
-By default, rules are written to the `elastalert-rules` ConfigMap **in the same namespace as the rule**. You can override both the ConfigMap name and namespace:
+By default, rules are written to the `elastalert-rules` ConfigMap **in the same namespace as the rule**. You can override the name, namespace and kind (`ConfigMap` or `Secret`), as long as the target is in the `targets` value:
 
 ```yaml
 apiVersion: alerts.example.dev/v1alpha1
@@ -126,7 +143,7 @@ This allows you to have rules in different namespaces all writing to a centraliz
 
 ### Opsgenie Integration
 
-Full example with Opsgenie alerting:
+Full example with Opsgenie alerting. Provide the API key through ElastAlert's global configuration, or with `secretRefs` (see the [main README](../../README.md#secrets)); rules that carry it inline get a `PlaintextCredentials` condition:
 
 ```yaml
 apiVersion: alerts.example.dev/v1alpha1
@@ -151,7 +168,6 @@ spec:
                 severity: "critical"
   alert:
     - opsgenie
-  opsgenie_key: "your-api-key-here"
   opsgenie_message: "Critical errors detected"
   opsgenie_priority: P1
   opsgenie_tags:
@@ -184,8 +200,6 @@ spec:
   alert:
     - post
   http_post_url: https://api.opsgenie.com/v2/heartbeats/elastalert/ping
-  http_post_headers:
-    Authorization: "GenieKey your-api-key"
   http_post_payload:
     _type: type
   name: '[monitoring] ElastAlert heartbeat'
@@ -193,7 +207,7 @@ spec:
 
 ## ConfigMap Structure
 
-The operator writes rules to ConfigMaps with the following structure:
+The operator writes one key per rule, named `<namespace>_<name>.yaml` unless `keyName` is set, using server-side apply with a field manager per rule:
 
 ```yaml
 apiVersion: v1
@@ -202,8 +216,8 @@ metadata:
   name: elastalert-rules
   namespace: monitoring
 data:
-  high-error-rate.yaml: |
-    name: high-error-rate
+  monitoring_high-error-rate.yaml: |
+    name: monitoring-high-error-rate
     type: frequency
     index: logs-*
     timeframe:
@@ -244,13 +258,12 @@ spec:
 
 ## RBAC Permissions
 
-The operator requires the following permissions:
+With `rbac.create=true` the chart creates:
 
-- **ConfigMaps**: create, get, list, patch, update, watch
-- **ElastAlertRules**: full CRUD operations
-- **Deployments**: get, patch, update (for rollout triggers)
-
-These are automatically created when `rbac.create=true`.
+- A ClusterRole for `ElastAlertRules` (get, list, watch, patch, update, status and finalizers) and `events.k8s.io` events. Secret `get` is added only when `secretRefs.enabled=true`.
+- One Role per target namespace: `get` and `patch` on the listed ConfigMaps or Secrets (by name), plus `list` and `watch` on ConfigMaps in that namespace for the operator's cache.
+- A Role for the ElastAlert Deployment (`get` and `patch` by name) when `elastalert.enabled=true`.
+- A Role for leader-election Leases (and their Events) in the release namespace.
 
 ## Upgrading
 
@@ -290,6 +303,8 @@ kubectl logs -n elastalert-rules-operator-system \
 kubectl get elastalertrules -n monitoring
 kubectl describe elastalertrule high-error-rate -n monitoring
 ```
+
+Failure reasons such as `TargetNotAllowed`, `PolicyViolation`, `KeyConflict` and `DuplicateRuleName` are listed in the [main README](../../README.md#supported-condition-types).
 
 ### Verify ConfigMap
 

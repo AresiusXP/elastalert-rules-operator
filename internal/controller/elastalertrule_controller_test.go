@@ -18,9 +18,8 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
-	"strings"
-	"time"
+	"fmt"
+	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -31,833 +30,577 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	alertsv1alpha1 "github.com/AresiusXP/elastalert-rules-operator/api/v1alpha1"
+	"github.com/AresiusXP/elastalert-rules-operator/internal/policy"
 )
 
-// Helper function to create timeframe RawExtension for 5 minutes
-func timeframe5Minutes() *runtime.RawExtension {
-	data, _ := json.Marshal(map[string]int{"minutes": 5})
-	return &runtime.RawExtension{Raw: data}
+var nsCounter atomic.Int32
+
+func newNamespace() string {
+	name := fmt.Sprintf("t%d", nsCounter.Add(1))
+	Expect(k8sClient.Create(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}})).To(Succeed())
+	return name
 }
 
-var _ = Describe("ElastAlertRule Controller", func() {
-	Context("When reconciling a resource", func() {
-		const (
-			resourceName = "test-rule"
-			namespace    = "default"
-			timeout      = time.Second * 10
-			interval     = time.Millisecond * 250
-		)
+func newTarget(ns, name string, data map[string]string) {
+	Expect(k8sClient.Create(context.Background(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Data: data,
+	})).To(Succeed())
+}
 
-		ctx := context.Background()
+func newReconciler(targets ...policy.Target) *ElastAlertRuleReconciler {
+	return &ElastAlertRuleReconciler{
+		Client:   k8sClient,
+		Scheme:   k8sClient.Scheme(),
+		Recorder: events.NewFakeRecorder(1000),
+		Policy:   policy.New(targets, nil, nil, nil),
+	}
+}
 
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: namespace,
-		}
+func cmTarget(ns, name string) policy.Target {
+	return policy.Target{Kind: "ConfigMap", Namespace: ns, Name: name}
+}
+
+func secretTarget(ns, name string) policy.Target {
+	return policy.Target{Kind: "Secret", Namespace: ns, Name: name}
+}
+
+func frequencyRule(ns, name string, mutate ...func(*alertsv1alpha1.ElastAlertRule)) *alertsv1alpha1.ElastAlertRule {
+	n := 5
+	rule := &alertsv1alpha1.ElastAlertRule{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: alertsv1alpha1.ElastAlertRuleSpec{
+			Type:      "frequency",
+			Index:     "logs-*",
+			NumEvents: &n,
+			Timeframe: &runtime.RawExtension{Raw: []byte(`{"minutes":5}`)},
+		},
+	}
+	for _, m := range mutate {
+		m(rule)
+	}
+	return rule
+}
+
+func createRule(rule *alertsv1alpha1.ElastAlertRule) {
+	Expect(k8sClient.Create(context.Background(), rule)).To(Succeed())
+}
+
+func reconcileRule(r *ElastAlertRuleReconciler, rule *alertsv1alpha1.ElastAlertRule) (reconcile.Result, error) {
+	return r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: rule.Namespace, Name: rule.Name},
+	})
+}
+
+func getRule(rule *alertsv1alpha1.ElastAlertRule) *alertsv1alpha1.ElastAlertRule {
+	out := &alertsv1alpha1.ElastAlertRule{}
+	Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(rule), out)).To(Succeed())
+	return out
+}
+
+func getCM(ns, name string) *corev1.ConfigMap {
+	cm := &corev1.ConfigMap{}
+	Expect(k8sClient.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: name}, cm)).To(Succeed())
+	return cm
+}
+
+func condition(rule *alertsv1alpha1.ElastAlertRule, condType string) *metav1.Condition {
+	return meta.FindStatusCondition(getRule(rule).Status.Conditions, condType)
+}
+
+func expectFailure(rule *alertsv1alpha1.ElastAlertRule, condType, reason string) {
+	c := condition(rule, condType)
+	ExpectWithOffset(1, c).NotTo(BeNil())
+	ExpectWithOffset(1, c.Status).To(Equal(metav1.ConditionTrue))
+	ExpectWithOffset(1, c.Reason).To(Equal(reason))
+	ready := condition(rule, alertsv1alpha1.ConditionTypeReady)
+	ExpectWithOffset(1, ready).NotTo(BeNil())
+	ExpectWithOffset(1, ready.Status).To(Equal(metav1.ConditionFalse))
+}
+
+var _ = Describe("ElastAlertRule controller", func() {
+	var (
+		ns string
+		r  *ElastAlertRuleReconciler
+	)
+
+	BeforeEach(func() {
+		ns = newNamespace()
+		newTarget(ns, "elastalert-rules", map[string]string{})
+		r = newReconciler(cmTarget(ns, "elastalert-rules"))
+	})
+
+	Describe("writing rules", func() {
+		It("writes the rule under a namespaced key and reports Ready", func() {
+			rule := frequencyRule(ns, "high-errors")
+			createRule(rule)
+
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+
+			cm := getCM(ns, "elastalert-rules")
+			key := ns + "_high-errors.yaml"
+			Expect(cm.Data).To(HaveKey(key))
+			Expect(cm.Data[key]).To(ContainSubstring("name: " + ns + "-high-errors"))
+			Expect(cm.Data[key]).To(ContainSubstring("type: frequency"))
+			Expect(cm.Data[key]).To(ContainSubstring("index: logs-*"))
+
+			got := getRule(rule)
+			Expect(got.Finalizers).To(ContainElement(alertsv1alpha1.FinalizerName))
+			ready := meta.FindStatusCondition(got.Status.Conditions, alertsv1alpha1.ConditionTypeReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+			Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
+			Expect(got.Status.RuleChecksum).NotTo(BeEmpty())
+			Expect(got.Status.LastReconciled).NotTo(BeNil())
+		})
+
+		It("updates the key when the spec changes and leaves the status alone when nothing changes", func() {
+			rule := frequencyRule(ns, "r1")
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			first := getRule(rule)
+
+			_, err = reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			second := getRule(rule)
+			Expect(second.ResourceVersion).To(Equal(first.ResourceVersion))
+			Expect(second.Status.LastReconciled).To(Equal(first.Status.LastReconciled))
+
+			second.Spec.Index = "other-*"
+			Expect(k8sClient.Update(context.Background(), second)).To(Succeed())
+			_, err = reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(getCM(ns, "elastalert-rules").Data[ns+"_r1.yaml"]).To(ContainSubstring("index: other-*"))
+			Expect(getRule(rule).Status.RuleChecksum).NotTo(Equal(first.Status.RuleChecksum))
+		})
+
+		It("keeps unrelated keys and other rules' keys", func() {
+			cm := getCM(ns, "elastalert-rules")
+			cm.Data = map[string]string{"manual.yaml": "name: manual\n"}
+			Expect(k8sClient.Update(context.Background(), cm)).To(Succeed())
+
+			a, b := frequencyRule(ns, "a"), frequencyRule(ns, "b")
+			createRule(a)
+			createRule(b)
+			for _, rule := range []*alertsv1alpha1.ElastAlertRule{a, b} {
+				_, err := reconcileRule(r, rule)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			Expect(getCM(ns, "elastalert-rules").Data).To(And(
+				HaveKey("manual.yaml"), HaveKey(ns+"_a.yaml"), HaveKey(ns+"_b.yaml")))
+		})
+
+		It("keeps same-named rules from different namespaces apart", func() {
+			other := newNamespace()
+			a := frequencyRule(ns, "same")
+			b := frequencyRule(other, "same", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.TargetConfigMap = alertsv1alpha1.TargetConfigMap{Namespace: ns, Name: "elastalert-rules"}
+			})
+			createRule(a)
+			createRule(b)
+			for _, rule := range []*alertsv1alpha1.ElastAlertRule{a, b} {
+				_, err := reconcileRule(r, rule)
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(getCM(ns, "elastalert-rules").Data).To(And(
+				HaveKey(ns+"_same.yaml"), HaveKey(other+"_same.yaml")))
+		})
+
+		It("removes only its own key on delete", func() {
+			a, b := frequencyRule(ns, "a"), frequencyRule(ns, "b")
+			createRule(a)
+			createRule(b)
+			for _, rule := range []*alertsv1alpha1.ElastAlertRule{a, b} {
+				_, err := reconcileRule(r, rule)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			Expect(k8sClient.Delete(context.Background(), a)).To(Succeed())
+			_, err := reconcileRule(r, a)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(getCM(ns, "elastalert-rules").Data).To(And(HaveKey(ns+"_b.yaml"), Not(HaveKey(ns+"_a.yaml"))))
+			err = k8sClient.Get(context.Background(), client.ObjectKeyFromObject(a), &alertsv1alpha1.ElastAlertRule{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	Describe("rejecting rules", func() {
+		It("refuses targets outside the allowlist", func() {
+			kubeSystemLike := newNamespace()
+			newTarget(kubeSystemLike, "aws-auth", map[string]string{"mapRoles": "original"})
+			rule := frequencyRule(ns, "evil", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.TargetConfigMap = alertsv1alpha1.TargetConfigMap{Namespace: kubeSystemLike, Name: "aws-auth"}
+				r.Spec.KeyName = "mapRoles.yaml"
+			})
+			createRule(rule)
+
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+
+			expectFailure(rule, alertsv1alpha1.ConditionTypeValidationFailed, "TargetNotAllowed")
+			Expect(getCM(kubeSystemLike, "aws-auth").Data).To(Equal(map[string]string{"mapRoles": "original"}))
+		})
+
+		It("does not touch a disallowed target when the rule is deleted", func() {
+			other := newNamespace()
+			newTarget(other, "elastalert-rules", map[string]string{"keep.yaml": "x"})
+			rule := frequencyRule(ns, "gone", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.TargetConfigMap = alertsv1alpha1.TargetConfigMap{Namespace: other, Name: "elastalert-rules"}
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Delete(context.Background(), rule)).To(Succeed())
+			_, err = reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(getCM(other, "elastalert-rules").Data).To(Equal(map[string]string{"keep.yaml": "x"}))
+			err = k8sClient.Get(context.Background(), client.ObjectKeyFromObject(rule), &alertsv1alpha1.ElastAlertRule{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("rejects alerters that are not on the allowlist", func() {
+			rule := frequencyRule(ns, "cmd", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.Alert = []string{"command"}
+				r.Spec.AdditionalFields = &runtime.RawExtension{Raw: []byte(`{"command":["/bin/sh"]}`)}
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeValidationFailed, "PolicyViolation")
+			Expect(getCM(ns, "elastalert-rules").Data).To(BeEmpty())
+		})
+
+		It("rejects additionalFields that point ElastAlert elsewhere", func() {
+			rule := frequencyRule(ns, "es", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.AdditionalFields = &runtime.RawExtension{Raw: []byte(`{"es_host":"attacker.example.org"}`)}
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeValidationFailed, "PolicyViolation")
+		})
+
+		It("reports a missing target", func() {
+			rule := frequencyRule(ns, "orphan", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.TargetConfigMap.Name = "missing"
+			})
+			createRule(rule)
+			r.Policy = policy.New([]policy.Target{cmTarget(ns, "missing")}, nil, nil, nil)
+
+			res, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			expectFailure(rule, alertsv1alpha1.ConditionTypeError, "TargetNotFound")
+			Expect(condition(rule, alertsv1alpha1.ConditionTypeError).Message).To(ContainSubstring("does not exist"))
+		})
+
+		It("rejects the younger of two rules with the same rule name", func() {
+			a := frequencyRule(ns, "first", func(r *alertsv1alpha1.ElastAlertRule) { r.Spec.Name = "shared name" })
+			createRule(a)
+			b := frequencyRule(ns, "second", func(r *alertsv1alpha1.ElastAlertRule) { r.Spec.Name = "shared name" })
+			createRule(b)
+
+			_, err := reconcileRule(r, a)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconcileRule(r, b)
+			Expect(err).NotTo(HaveOccurred())
+
+			expectFailure(b, alertsv1alpha1.ConditionTypeValidationFailed, "DuplicateRuleName")
+			Expect(condition(a, alertsv1alpha1.ConditionTypeReady).Status).To(Equal(metav1.ConditionTrue))
+			Expect(getCM(ns, "elastalert-rules").Data).To(And(HaveKey(ns+"_first.yaml"), Not(HaveKey(ns+"_second.yaml"))))
+		})
+
+		It("reports a conflict instead of overwriting a key owned by someone else", func() {
+			cm := getCM(ns, "elastalert-rules")
+			cm.Data = map[string]string{"shared.yaml": "name: owned-by-someone-else\n"}
+			Expect(k8sClient.Update(context.Background(), cm)).To(Succeed())
+
+			rule := frequencyRule(ns, "clash", func(r *alertsv1alpha1.ElastAlertRule) { r.Spec.KeyName = "shared.yaml" })
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+
+			expectFailure(rule, alertsv1alpha1.ConditionTypeError, "KeyConflict")
+			Expect(getCM(ns, "elastalert-rules").Data["shared.yaml"]).To(Equal("name: owned-by-someone-else\n"))
+		})
+
+		It("reports a conflict between two rules using the same keyName", func() {
+			a := frequencyRule(ns, "a", func(r *alertsv1alpha1.ElastAlertRule) { r.Spec.KeyName = "same.yaml" })
+			b := frequencyRule(ns, "b", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.KeyName = "same.yaml"
+				r.Spec.Index = "different-*"
+			})
+			createRule(a)
+			createRule(b)
+			_, err := reconcileRule(r, a)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconcileRule(r, b)
+			Expect(err).NotTo(HaveOccurred())
+
+			expectFailure(b, alertsv1alpha1.ConditionTypeError, "KeyConflict")
+			Expect(getCM(ns, "elastalert-rules").Data["same.yaml"]).To(ContainSubstring("index: logs-*"))
+		})
+	})
+
+	Describe("policy changes", func() {
+		It("withdraws a rule that stops being acceptable", func() {
+			rule := frequencyRule(ns, "withdrawn", func(r *alertsv1alpha1.ElastAlertRule) { r.Spec.Alert = []string{"slack"} })
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(getCM(ns, "elastalert-rules").Data).To(HaveKey(ns + "_withdrawn.yaml"))
+
+			r.Policy = policy.New(r.Policy.Targets, []string{"debug"}, nil, nil)
+			_, err = reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+
+			expectFailure(rule, alertsv1alpha1.ConditionTypeValidationFailed, "PolicyViolation")
+			Expect(getCM(ns, "elastalert-rules").Data).NotTo(HaveKey(ns + "_withdrawn.yaml"))
+		})
+
+		It("rejects URL fields smuggled in through additionalFields", func() {
+			r.Policy = policy.New(r.Policy.Targets, nil, nil, []string{"hooks.example.com"})
+			rule := frequencyRule(ns, "smuggle", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.Alert = []string{"post"}
+				r.Spec.AdditionalFields = &runtime.RawExtension{Raw: []byte(`{"http_post_url":["https://evil.example.org"]}`)}
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeValidationFailed, "PolicyViolation")
+			Expect(getCM(ns, "elastalert-rules").Data).To(BeEmpty())
+		})
+
+		It("keeps the target immutable", func() {
+			rule := frequencyRule(ns, "pinned")
+			createRule(rule)
+			stored := getRule(rule)
+			stored.Spec.TargetConfigMap.Name = "elsewhere"
+			Expect(k8sClient.Update(context.Background(), stored)).NotTo(Succeed())
+		})
+	})
+
+	Describe("admission", func() {
+		It("is enforced by the CRD schema", func() {
+			ctx := context.Background()
+			Expect(k8sClient.Create(ctx, frequencyRule(ns, "t1", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.Type = "my_module.MyRule"
+			}))).NotTo(Succeed())
+			Expect(k8sClient.Create(ctx, frequencyRule(ns, "t2", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.NumEvents = nil
+			}))).NotTo(Succeed())
+			Expect(k8sClient.Create(ctx, frequencyRule(ns, "t3", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.KeyName = "no-extension"
+			}))).NotTo(Succeed())
+			Expect(k8sClient.Create(ctx, frequencyRule(ns, "t4", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.SecretRefs = []alertsv1alpha1.SecretRef{{Field: "opsgenie_key", Name: "s", Key: "k"}}
+			}))).NotTo(Succeed())
+			Expect(k8sClient.Create(ctx, frequencyRule(ns, "ok", func(r *alertsv1alpha1.ElastAlertRule) {
+				r.Spec.TargetConfigMap.Kind = alertsv1alpha1.TargetKindSecret
+				r.Spec.SecretRefs = []alertsv1alpha1.SecretRef{{Field: "opsgenie_key", Name: "s", Key: "k"}}
+			}))).To(Succeed())
+		})
+	})
+
+	Describe("secrets", func() {
+		var secretRule func(mutate ...func(*alertsv1alpha1.ElastAlertRule)) *alertsv1alpha1.ElastAlertRule
 
 		BeforeEach(func() {
-			// Ensure clean state before each test
-			// Try to delete any existing resource
-			resource := &alertsv1alpha1.ElastAlertRule{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			if err == nil {
-				// Remove finalizer to allow immediate deletion
-				if controllerutil.ContainsFinalizer(resource, alertsv1alpha1.FinalizerName) {
-					patch := client.MergeFrom(resource.DeepCopy())
-					controllerutil.RemoveFinalizer(resource, alertsv1alpha1.FinalizerName)
-					_ = k8sClient.Patch(ctx, resource, patch)
-				}
-				_ = k8sClient.Delete(ctx, resource)
-			}
+			Expect(k8sClient.Create(context.Background(), &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "elastalert-rules", Namespace: ns},
+			})).To(Succeed())
+			r = newReconciler(secretTarget(ns, "elastalert-rules"))
+			r.EnableSecretRefs = true
 
-			// Clean up ConfigMap if it exists
-			cm := &corev1.ConfigMap{}
-			cmKey := types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}
-			err = k8sClient.Get(ctx, cmKey, cm)
-			if err == nil {
-				_ = k8sClient.Delete(ctx, cm)
-			}
-
-			// Wait for all resources to be fully deleted
-			Eventually(func() bool {
-				resourceGone := apierrors.IsNotFound(k8sClient.Get(ctx, typeNamespacedName, &alertsv1alpha1.ElastAlertRule{}))
-				cmGone := apierrors.IsNotFound(k8sClient.Get(ctx, cmKey, &corev1.ConfigMap{}))
-				return resourceGone && cmGone
-			}, timeout, interval).Should(BeTrue(), "Resources should be deleted before test starts")
-		})
-
-		AfterEach(func() {
-			// Clean up - remove finalizer first to allow deletion
-			resource := &alertsv1alpha1.ElastAlertRule{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			if err == nil {
-				if controllerutil.ContainsFinalizer(resource, alertsv1alpha1.FinalizerName) {
-					controllerutil.RemoveFinalizer(resource, alertsv1alpha1.FinalizerName)
-					_ = k8sClient.Update(ctx, resource)
-				}
-				_ = k8sClient.Delete(ctx, resource)
-			}
-		})
-
-		It("should successfully reconcile and update ConfigMap key", func() {
-			By("Creating the target ConfigMap first")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-
-			By("Creating the ElastAlertRule")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					Timeframe: timeframe5Minutes(),
-					NumEvents: &numEvents,
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			By("Reconciling the created resource")
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second reconcile updates the ConfigMap
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking the ConfigMap was updated with the rule")
-			updatedCm := &corev1.ConfigMap{}
-			cmKey := types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}
-			Eventually(func() error {
-				return k8sClient.Get(ctx, cmKey, updatedCm)
-			}, timeout, interval).Should(Succeed())
-
-			expectedKey := resourceName + ".yaml"
-			Expect(updatedCm.Data).To(HaveKey(expectedKey))
-			Expect(updatedCm.Data[expectedKey]).To(ContainSubstring("name: test-rule"))
-			Expect(updatedCm.Data[expectedKey]).To(ContainSubstring("type: frequency"))
-			Expect(updatedCm.Data[expectedKey]).To(ContainSubstring("index: logs-*"))
-
-			By("Checking the status was updated")
-			updatedResource := &alertsv1alpha1.ElastAlertRule{}
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, typeNamespacedName, updatedResource)
-				if err != nil {
-					return false
-				}
-				readyCondition := meta.FindStatusCondition(updatedResource.Status.Conditions, alertsv1alpha1.ConditionTypeReady)
-				return readyCondition != nil && readyCondition.Status == metav1.ConditionTrue
-			}, timeout, interval).Should(BeTrue())
-		})
-
-		It("should update ConfigMap key when rule is updated", func() {
-			By("Creating the target ConfigMap first")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-
-			By("Creating the ElastAlertRule")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					Timeframe: timeframe5Minutes(),
-					NumEvents: &numEvents,
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second reconcile updates ConfigMap
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Updating the rule")
-			updatedResource := &alertsv1alpha1.ElastAlertRule{}
-			Eventually(func() error {
-				return k8sClient.Get(ctx, typeNamespacedName, updatedResource)
-			}, timeout, interval).Should(Succeed())
-
-			newNumEvents := 20
-			updatedResource.Spec.NumEvents = &newNumEvents
-			updatedResource.Spec.AlertText = "Test alert"
-			Expect(k8sClient.Update(ctx, updatedResource)).To(Succeed())
-
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking the ConfigMap was updated")
-			updatedCm := &corev1.ConfigMap{}
-			cmKey := types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}
-			Eventually(func() string {
-				err := k8sClient.Get(ctx, cmKey, updatedCm)
-				if err != nil {
-					return ""
-				}
-				expectedKey := resourceName + ".yaml"
-				return updatedCm.Data[expectedKey]
-			}, timeout, interval).Should(ContainSubstring("num_events: 20"))
-
-			expectedKey := resourceName + ".yaml"
-			Expect(updatedCm.Data[expectedKey]).To(ContainSubstring("alert_text: Test alert"))
-		})
-
-		It("should remove ConfigMap key when rule is deleted", func() {
-			By("Creating the target ConfigMap first")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-
-			By("Creating the ElastAlertRule")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					Timeframe: timeframe5Minutes(),
-					NumEvents: &numEvents,
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second reconcile updates ConfigMap
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Verifying ConfigMap key exists")
-			updatedCm := &corev1.ConfigMap{}
-			cmKey := types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}
-			Eventually(func() error {
-				return k8sClient.Get(ctx, cmKey, updatedCm)
-			}, timeout, interval).Should(Succeed())
-
-			expectedKey := resourceName + ".yaml"
-			Expect(updatedCm.Data).To(HaveKey(expectedKey))
-
-			By("Deleting the ElastAlertRule")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking the ConfigMap key was removed")
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, cmKey, updatedCm)
-				if err != nil {
-					return false
-				}
-				_, exists := updatedCm.Data[expectedKey]
-				return !exists
-			}, timeout, interval).Should(BeTrue())
-		})
-
-		It("should set validation failed condition for invalid spec", func() {
-			By("Creating an ElastAlertRule with frequency type but missing numEvents")
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "test-*",
-					Timeframe: timeframe5Minutes(),
-					// Missing numEvents which is required for frequency type
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			By("Reconciling the created resource")
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second reconcile should detect validation failure
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking validation failed condition is set")
-			updatedResource := &alertsv1alpha1.ElastAlertRule{}
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, typeNamespacedName, updatedResource)
-				if err != nil {
-					return false
-				}
-				validationCondition := meta.FindStatusCondition(updatedResource.Status.Conditions, alertsv1alpha1.ConditionTypeValidationFailed)
-				return validationCondition != nil && validationCondition.Status == metav1.ConditionTrue
-			}, timeout, interval).Should(BeTrue())
-		})
-
-		It("should preserve other ConfigMap keys", func() {
-			By("Creating a ConfigMap with existing data")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{
-					"existing.rule.yaml": "name: existing\ntype: any\nindex: test-*",
-				},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-
-			By("Creating the ElastAlertRule")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					Timeframe: timeframe5Minutes(),
-					NumEvents: &numEvents,
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second reconcile updates ConfigMap
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking both keys exist in ConfigMap")
-			updatedCm := &corev1.ConfigMap{}
-			cmKey := types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, cmKey, updatedCm)
-				if err != nil {
-					return false
-				}
-				newKey := resourceName + ".yaml"
-				return len(updatedCm.Data) == 2 &&
-					updatedCm.Data["existing.rule.yaml"] != "" &&
-					updatedCm.Data[newKey] != ""
-			}, timeout, interval).Should(BeTrue())
-		})
-
-		It("should fail when target ConfigMap does not exist", func() {
-			By("Creating an ElastAlertRule without creating the ConfigMap first")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					Timeframe: timeframe5Minutes(),
-					NumEvents: &numEvents,
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second reconcile should fail because ConfigMap doesn't exist
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("target ConfigMap"))
-			Expect(err.Error()).To(ContainSubstring("does not exist"))
-
-			By("Checking the status shows an error condition")
-			updatedResource := &alertsv1alpha1.ElastAlertRule{}
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, typeNamespacedName, updatedResource)
-				if err != nil {
-					return false
-				}
-				errorCondition := meta.FindStatusCondition(updatedResource.Status.Conditions, alertsv1alpha1.ConditionTypeError)
-				return errorCondition != nil && errorCondition.Status == metav1.ConditionTrue
-			}, timeout, interval).Should(BeTrue())
-		})
-
-		It("should create ConfigMap with Opsgenie fields", func() {
-			By("Creating a ConfigMap first")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-
-			By("Creating an ElastAlertRule with Opsgenie configuration")
-			numEvents := 1
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "opsgenie-test-rule",
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:             "frequency",
-					Index:            "logs-*",
-					Timeframe:        timeframe5Minutes(),
-					NumEvents:        &numEvents,
-					AlertText:        "{0}: {1}",
-					AlertTextArgs:    []string{"component", "message"},
-					Alert:            []string{"opsgenie"},
-					OpsgenieKey:      "test-key",
-					OpsgenieMessage:  "Test message",
-					OpsgeniePriority: "P1",
-					OpsgenieTags:     []string{"test", "critical"},
-					OpsgenieTeams:    []string{"ops-team"},
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "opsgenie-test-rule", Namespace: namespace},
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second reconcile updates ConfigMap
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "opsgenie-test-rule", Namespace: namespace},
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking ConfigMap contains Opsgenie fields")
-			updatedCm := &corev1.ConfigMap{}
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}, updatedCm)
-				if err != nil {
-					return false
-				}
-				key := "opsgenie-test-rule.yaml"
-				if ruleYaml, exists := updatedCm.Data[key]; exists {
-					return strings.Contains(ruleYaml, "opsgenie_key: test-key") &&
-						strings.Contains(ruleYaml, "opsgenie_message: Test message") &&
-						strings.Contains(ruleYaml, "opsgenie_priority: P1") &&
-						strings.Contains(ruleYaml, "opsgenie_teams:") &&
-						strings.Contains(ruleYaml, "- ops-team") &&
-						strings.Contains(ruleYaml, "opsgenie_tags:") &&
-						strings.Contains(ruleYaml, "- test") &&
-						strings.Contains(ruleYaml, "- critical") &&
-						strings.Contains(ruleYaml, "alert_text_args:") &&
-						strings.Contains(ruleYaml, "- component")
-				}
-				return false
-			}, timeout, interval).Should(BeTrue())
-		})
-
-		It("should create ConfigMap with filter list", func() {
-			By("Creating a ConfigMap first")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-
-			By("Creating an ElastAlertRule with filter list")
-			numEvents := 5
-			filter1, _ := json.Marshal(map[string]interface{}{
-				"term": map[string]string{"level": "error"},
-			})
-			filter2, _ := json.Marshal(map[string]interface{}{
-				"range": map[string]interface{}{
-					"timestamp": map[string]string{"gte": "now-1h"},
-				},
-			})
-
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "filter-test-rule",
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					NumEvents: &numEvents,
-					Filter: []runtime.RawExtension{
-						{Raw: filter1},
-						{Raw: filter2},
+			secretRule = func(mutate ...func(*alertsv1alpha1.ElastAlertRule)) *alertsv1alpha1.ElastAlertRule {
+				return frequencyRule(ns, "with-secret", append([]func(*alertsv1alpha1.ElastAlertRule){
+					func(rule *alertsv1alpha1.ElastAlertRule) {
+						rule.Spec.TargetConfigMap.Kind = alertsv1alpha1.TargetKindSecret
+						rule.Spec.Alert = []string{"opsgenie"}
+						rule.Spec.SecretRefs = []alertsv1alpha1.SecretRef{{Field: "opsgenie_key", Name: "credentials", Key: "key"}}
 					},
-				},
+				}, mutate...)...)
 			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// Reconcile
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "filter-test-rule", Namespace: namespace},
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "filter-test-rule", Namespace: namespace},
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking ConfigMap contains filter list")
-			updatedCm := &corev1.ConfigMap{}
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}, updatedCm)
-				if err != nil {
-					return false
-				}
-				key := "filter-test-rule.yaml"
-				if ruleYaml, exists := updatedCm.Data[key]; exists {
-					return strings.Contains(ruleYaml, "filter:") &&
-						strings.Contains(ruleYaml, "level: error") &&
-						strings.Contains(ruleYaml, "timestamp:")
-				}
-				return false
-			}, timeout, interval).Should(BeTrue())
 		})
 
-		It("should use custom spec.name in ConfigMap", func() {
-			By("Creating a ConfigMap first")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		credentials := func(labels map[string]string) {
+			Expect(k8sClient.Create(context.Background(), &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: ns, Labels: labels},
+				Data:       map[string][]byte{"key": []byte("s3cr3t"), "headers": []byte("Authorization: Bearer abc\n")},
+			})).To(Succeed())
+		}
 
-			By("Creating an ElastAlertRule with custom name")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "cr-name",
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					NumEvents: &numEvents,
-					Name:      "[team-platform] Custom Rule Name",
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		It("writes the rule with the secret value into a Secret target", func() {
+			credentials(map[string]string{SourceLabel: "true"})
+			rule := secretRule()
+			createRule(rule)
 
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// Reconcile
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "cr-name", Namespace: namespace},
-			})
+			_, err := reconcileRule(r, rule)
 			Expect(err).NotTo(HaveOccurred())
 
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: "cr-name", Namespace: namespace},
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking ConfigMap uses CR name for key but custom name in YAML")
-			updatedCm := &corev1.ConfigMap{}
-			Eventually(func() bool {
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: "elastalert-rules", Namespace: namespace}, updatedCm)
-				if err != nil {
-					return false
-				}
-				key := "cr-name.yaml"
-				if ruleYaml, exists := updatedCm.Data[key]; exists {
-					// Should use custom name in YAML, not CR name
-					return strings.Contains(ruleYaml, "name: '[team-platform] Custom Rule Name'") &&
-						!strings.Contains(ruleYaml, "name: cr-name")
-				}
-				return false
-			}, timeout, interval).Should(BeTrue())
+			target := &corev1.Secret{}
+			Expect(k8sClient.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "elastalert-rules"}, target)).To(Succeed())
+			Expect(string(target.Data[ns+"_with-secret.yaml"])).To(ContainSubstring("opsgenie_key: s3cr3t"))
+			Expect(condition(rule, alertsv1alpha1.ConditionTypeReady).Status).To(Equal(metav1.ConditionTrue))
+			Expect(getRule(rule).Status.Conditions).NotTo(ContainElement(HaveField("Message", ContainSubstring("s3cr3t"))))
 		})
 
-		It("should trigger deployment rollout when rollout is enabled", func() {
-			const deploymentName = "elastalert"
+		It("parses yaml secretRefs into structured values", func() {
+			credentials(map[string]string{SourceLabel: "true"})
+			rule := secretRule(func(rule *alertsv1alpha1.ElastAlertRule) {
+				rule.Spec.SecretRefs = append(rule.Spec.SecretRefs,
+					alertsv1alpha1.SecretRef{Field: "http_post_headers", Name: "credentials", Key: "headers", Format: "yaml"})
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
 
-			By("Enabling rollout via environment variables")
-			GinkgoT().Setenv("ELASTALERT_ROLLOUT_ENABLED", "true")
-			GinkgoT().Setenv("ELASTALERT_DEPLOYMENT_NAME", deploymentName)
-			GinkgoT().Setenv("ELASTALERT_DEPLOYMENT_NAMESPACE", namespace)
+			target := &corev1.Secret{}
+			Expect(k8sClient.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: "elastalert-rules"}, target)).To(Succeed())
+			Expect(string(target.Data[ns+"_with-secret.yaml"])).To(ContainSubstring("Authorization: Bearer abc"))
+		})
 
-			By("Creating the target ConfigMap and Deployment")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
+		It("does not leak secret content through YAML errors", func() {
+			Expect(k8sClient.Create(context.Background(), &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: ns, Labels: map[string]string{SourceLabel: "true"}},
+				Data:       map[string][]byte{"headers": []byte("!!int TOP-SECRET-VALUE")},
+			})).To(Succeed())
+			rule := secretRule(func(rule *alertsv1alpha1.ElastAlertRule) {
+				rule.Spec.SecretRefs = []alertsv1alpha1.SecretRef{
+					{Field: "http_post_headers", Name: "credentials", Key: "headers", Format: "yaml"}}
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeError, "SecretRefFailed")
+			for _, c := range getRule(rule).Status.Conditions {
+				Expect(c.Message).NotTo(ContainSubstring("TOP-SECRET-VALUE"))
 			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		})
 
-			deployment := &appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      deploymentName,
-					Namespace: namespace,
-				},
+		It("checks URL values that come from a Secret against the host allowlist", func() {
+			Expect(k8sClient.Create(context.Background(), &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: ns, Labels: map[string]string{SourceLabel: "true"}},
+				Data:       map[string][]byte{"url": []byte("https://evil.example.org/hook")},
+			})).To(Succeed())
+			r.Policy = policy.New(r.Policy.Targets, nil, nil, []string{"hooks.example.com"})
+			rule := secretRule(func(rule *alertsv1alpha1.ElastAlertRule) {
+				rule.Spec.Alert = []string{"slack"}
+				rule.Spec.SecretRefs = []alertsv1alpha1.SecretRef{{Field: "slack_webhook_url", Name: "credentials", Key: "url"}}
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeValidationFailed, "PolicyViolation")
+		})
+
+		It("refuses Secrets without the source label", func() {
+			credentials(nil)
+			rule := secretRule()
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeError, "SecretRefFailed")
+			Expect(condition(rule, alertsv1alpha1.ConditionTypeError).Message).To(ContainSubstring(SourceLabel))
+		})
+
+		It("refuses secretRefs when the feature is disabled", func() {
+			credentials(map[string]string{SourceLabel: "true"})
+			r.EnableSecretRefs = false
+			rule := secretRule()
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeError, "SecretRefFailed")
+		})
+
+		It("refuses to read a write target as a source", func() {
+			rule := secretRule(func(rule *alertsv1alpha1.ElastAlertRule) {
+				rule.Spec.SecretRefs[0].Name = "elastalert-rules"
+			})
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			expectFailure(rule, alertsv1alpha1.ConditionTypeError, "SecretRefFailed")
+			Expect(condition(rule, alertsv1alpha1.ConditionTypeError).Message).To(ContainSubstring("write target"))
+		})
+
+		It("warns about inline credentials", func() {
+			rule := frequencyRule(ns, "inline", func(rule *alertsv1alpha1.ElastAlertRule) {
+				rule.Spec.Alert = []string{"opsgenie"}
+				rule.Spec.OpsgenieKey = "inline-key"
+			})
+			r = newReconciler(cmTarget(ns, "elastalert-rules"))
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			c := condition(rule, alertsv1alpha1.ConditionTypePlaintextCredentials)
+			Expect(c).NotTo(BeNil())
+			Expect(c.Status).To(Equal(metav1.ConditionTrue))
+		})
+	})
+
+	Describe("rollout", func() {
+		var deployKey types.NamespacedName
+
+		BeforeEach(func() {
+			deployKey = types.NamespacedName{Namespace: ns, Name: "elastalert"}
+			labels := map[string]string{"app": "elastalert"}
+			Expect(k8sClient.Create(context.Background(), &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Name: "elastalert", Namespace: ns},
 				Spec: appsv1.DeploymentSpec{
-					Selector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"app": deploymentName},
-					},
+					Selector: &metav1.LabelSelector{MatchLabels: labels},
 					Template: corev1.PodTemplateSpec{
-						ObjectMeta: metav1.ObjectMeta{
-							Labels: map[string]string{"app": deploymentName},
-						},
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{
-								{Name: "elastalert", Image: "elastalert:latest"},
-							},
-						},
+						ObjectMeta: metav1.ObjectMeta{Labels: labels},
+						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
 					},
 				},
-			}
-			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
-			DeferCleanup(func() {
-				_ = k8sClient.Delete(ctx, deployment)
-			})
-
-			By("Creating and reconciling the ElastAlertRule")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					Timeframe: timeframe5Minutes(),
-					NumEvents: &numEvents,
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			// First reconcile adds finalizer, second writes ConfigMap + triggers rollout
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking the deployment received the rules-checksum annotation")
-			deployKey := types.NamespacedName{Name: deploymentName, Namespace: namespace}
-			var firstChecksum string
-			Eventually(func() string {
-				updated := &appsv1.Deployment{}
-				if err := k8sClient.Get(ctx, deployKey, updated); err != nil {
-					return ""
-				}
-				firstChecksum = updated.Spec.Template.Annotations[rulesChecksumAnnotation]
-				return firstChecksum
-			}, timeout, interval).ShouldNot(BeEmpty())
-
-			By("Verifying an unchanged checksum does not rewrite the deployment")
-			beforeRV := &appsv1.Deployment{}
-			Expect(k8sClient.Get(ctx, deployKey, beforeRV)).To(Succeed())
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-			afterRV := &appsv1.Deployment{}
-			Expect(k8sClient.Get(ctx, deployKey, afterRV)).To(Succeed())
-			Expect(afterRV.ResourceVersion).To(Equal(beforeRV.ResourceVersion),
-				"deployment should not be updated when checksum is unchanged")
+			})).To(Succeed())
 		})
 
-		It("should not trigger rollout when rollout is disabled", func() {
-			const deploymentName = "elastalert-disabled"
+		annotation := func() string {
+			d := &appsv1.Deployment{}
+			Expect(k8sClient.Get(context.Background(), deployKey, d)).To(Succeed())
+			return d.Spec.Template.Annotations[rulesChecksumAnnotation]
+		}
 
-			By("Explicitly disabling rollout")
-			GinkgoT().Setenv("ELASTALERT_ROLLOUT_ENABLED", "false")
-			GinkgoT().Setenv("ELASTALERT_DEPLOYMENT_NAME", deploymentName)
-			GinkgoT().Setenv("ELASTALERT_DEPLOYMENT_NAMESPACE", namespace)
-
-			By("Creating the target ConfigMap and Deployment")
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "elastalert-rules",
-					Namespace: namespace,
-				},
-				Data: map[string]string{},
-			}
-			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
-
-			deployment := &appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      deploymentName,
-					Namespace: namespace,
-				},
-				Spec: appsv1.DeploymentSpec{
-					Selector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"app": deploymentName},
-					},
-					Template: corev1.PodTemplateSpec{
-						ObjectMeta: metav1.ObjectMeta{
-							Labels: map[string]string{"app": deploymentName},
-						},
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{
-								{Name: "elastalert", Image: "elastalert:latest"},
-							},
-						},
-					},
-				},
-			}
-			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
-			DeferCleanup(func() {
-				_ = k8sClient.Delete(ctx, deployment)
-			})
-
-			By("Creating and reconciling the ElastAlertRule")
-			numEvents := 10
-			resource := &alertsv1alpha1.ElastAlertRule{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      resourceName,
-					Namespace: namespace,
-				},
-				Spec: alertsv1alpha1.ElastAlertRuleSpec{
-					Type:      "frequency",
-					Index:     "logs-*",
-					Timeframe: timeframe5Minutes(),
-					NumEvents: &numEvents,
-				},
-			}
-			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-
-			controllerReconciler := &ElastAlertRuleReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+		It("annotates the Deployment and only changes the annotation when rules change", func() {
+			r.Rollout = &deployKey
+			rule := frequencyRule(ns, "roll")
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
 			Expect(err).NotTo(HaveOccurred())
-			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
+			first := annotation()
+			Expect(first).NotTo(BeEmpty())
 
-			By("Verifying the deployment was never annotated with a checksum")
-			Consistently(func() map[string]string {
-				updated := &appsv1.Deployment{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: deploymentName, Namespace: namespace}, updated); err != nil {
-					return map[string]string{}
-				}
-				return updated.Spec.Template.Annotations
-			}, time.Second*2, interval).ShouldNot(HaveKey(rulesChecksumAnnotation))
+			_, err = reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(annotation()).To(Equal(first))
+
+			stored := getRule(rule)
+			stored.Spec.Index = "changed-*"
+			Expect(k8sClient.Update(context.Background(), stored)).To(Succeed())
+			_, err = reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(annotation()).NotTo(Equal(first))
+		})
+
+		It("does nothing when rollout is not configured", func() {
+			rule := frequencyRule(ns, "noroll")
+			createRule(rule)
+			_, err := reconcileRule(r, rule)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(annotation()).To(BeEmpty())
 		})
 	})
 })

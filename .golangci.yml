@@ -41,20 +41,9 @@ linters:
       - linters:
           - goconst
         path: _test\.go
-      # Pre-existing deprecations surfaced by the golangci-lint v2.13.2 bump
-      # (staticcheck picking up controller-runtime v0.25.0's newly-annotated
-      # APIs). Tracked for a dedicated follow-up rather than a drive-by fix
-      # here, since each has real behavior/type implications:
-      #  - scheme.Builder: cosmetic, but bundled with the others for one ticket.
-      #  - GetEventRecorderFor: replacement returns a different recorder type
-      #    (recorder.EventRecorder, not record.EventRecorder), touching the
-      #    Recorder field, recordEvent() helper, and test fakes.
-      #  - ctrl.Result{Requeue: true}: this is the documented IsConflict retry
-      #    pattern; swapping to RequeueAfter changes retry timing and
-      #    needs its own reviewed change, not a silent rename.
       - linters:
           - staticcheck
-        text: scheme\.Builder is deprecated|GetEventRecorderFor is deprecated|\.Result\)\.Requeue is deprecated
+        text: scheme\.Builder is deprecated
     paths:
       - third_party$
       - builtin$

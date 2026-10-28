@@ -1,43 +1,23 @@
 {{- if .Values.rbac.create -}}
+{{- $fullname := include "elastalert-rules-operator.fullname" . -}}
+{{- $sa := include "elastalert-rules-operator.serviceAccountName" . -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "elastalert-rules-operator.fullname" . }}-manager-role
+  name: {{ $fullname }}-manager-role
   labels:
     {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - configmaps
-  - events
-  verbs:
-  - create
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  verbs:
-  - get
-  - patch
-  - update
 - apiGroups:
   - alerts.example.dev
   resources:
   - elastalertrules
   verbs:
-  - create
-  - delete
   - get
   - list
+  - watch
   - patch
   - update
-  - watch
 - apiGroups:
   - alerts.example.dev
   resources:
@@ -53,6 +33,88 @@ rules:
   - patch
   - update
 - apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+{{- if .Values.secretRefs.enabled }}
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+{{- end }}
+{{- if .Values.metrics.enabled }}
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-manager-rolebinding
+  labels:
+    {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-manager-role
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace | quote }}
+{{- if .Values.metrics.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-metrics-reader
+  labels:
+    {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
+rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+{{- with .Values.metrics.readerSubjects }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}-metrics-reader
+  labels:
+    {{- include "elastalert-rules-operator.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-metrics-reader
+subjects:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-leader-election
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
+rules:
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
@@ -62,4 +124,124 @@ rules:
   - watch
   - create
   - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-leader-election
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-leader-election
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace | quote }}
+{{- range $ns, $kinds := (include "elastalert-rules-operator.targetsByNamespace" . | fromJson) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-targets
+  namespace: {{ $ns | quote }}
+  labels:
+    {{- include "elastalert-rules-operator.labels" $ | nindent 4 }}
+rules:
+{{- with $kinds.ConfigMap }}
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  resourceNames:
+  {{- range . }}
+  - {{ . | quote }}
+  {{- end }}
+  verbs:
+  - get
+  - patch
+{{- end }}
+{{- with $kinds.Secret }}
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  resourceNames:
+  {{- range . }}
+  - {{ . | quote }}
+  {{- end }}
+  verbs:
+  - get
+  - patch
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-targets
+  namespace: {{ $ns | quote }}
+  labels:
+    {{- include "elastalert-rules-operator.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-targets
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ $.Release.Namespace | quote }}
+{{- end }}
+{{- if .Values.elastalert.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-rollout
+  namespace: {{ include "elastalert-rules-operator.rolloutNamespace" . | quote }}
+  labels:
+    {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  resourceNames:
+  - {{ .Values.elastalert.deploymentName | quote }}
+  verbs:
+  - get
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-rollout
+  namespace: {{ include "elastalert-rules-operator.rolloutNamespace" . | quote }}
+  labels:
+    {{- include "elastalert-rules-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-rollout
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ .Release.Namespace | quote }}
+{{- end }}
 {{- end }}

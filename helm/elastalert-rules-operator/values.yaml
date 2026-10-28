@@ -29,6 +29,8 @@ podAnnotations: {}
 podLabels: {}
 
 podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
@@ -46,40 +48,51 @@ securityContext:
 resources:
   limits:
     cpu: 500m
-    memory: 128Mi
+    memory: 256Mi
   requests:
     cpu: 10m
     memory: 64Mi
 
-# Optional: Configure automatic rollout trigger for ElastAlert deployment
-# When configured, the operator will update the deployment's pod template
-# annotation when rule checksums change, triggering a rolling update
+# Rollout of the ElastAlert Deployment after rules change. The operator
+# patches the pod template annotation alerts.example.dev/rules-checksum.
 elastalert:
-  # Enable automatic rollout trigger
   enabled: false
-  # Name of the ElastAlert deployment to trigger rollout
   deploymentName: "elastalert"
-  # Namespace of the ElastAlert deployment
-  deploymentNamespace: "monitoring"
+  # Defaults to the release namespace
+  deploymentNamespace: ""
 
-# ConfigMap Configuration
-# The operator writes ElastAlert rules to ConfigMaps. Each ElastAlertRule CR
-# can specify its target ConfigMap using spec.targetConfigMap.name and namespace.
-# Default behavior (if not specified in the CR):
-#   - ConfigMap name: "elastalert-rules"
-#   - Namespace: same as the ElastAlertRule CR
-#
-# Example ElastAlertRule CR with custom ConfigMap:
-#   apiVersion: alerts.example.dev/v1alpha1
-#   kind: ElastAlertRule
-#   metadata:
-#     name: my-rule
-#   spec:
-#     type: frequency
-#     index: "logs-*"
-#     targetConfigMap:
-#       name: "my-elastalert-rules"      # Optional: defaults to "elastalert-rules"
-#       namespace: "monitoring"          # Optional: defaults to rule's namespace
+# Objects rules may write to. Rules pointing anywhere else are rejected, and
+# RBAC is generated for exactly these objects. They must already exist.
+targets:
+  - name: elastalert-rules
+    kind: ConfigMap
+    # Defaults to the release namespace
+    namespace: ""
+
+policy:
+  # ElastAlert alerters rules may use. post2 renders payloads with an unsandboxed
+  # Jinja template, so only add it when every rule author is trusted.
+  allowedAlerters:
+    - opsgenie
+    - post
+    - slack
+    - msteams
+    - email
+    - alertmanager
+    - debug
+  # Extra ElastAlert settings additionalFields and secretRefs may use. The built-in
+  # list covers common options; settings that run code stay blocked regardless.
+  allowedAdditionalFields: []
+  # Glob patterns of indices rules may query; empty allows every index
+  allowedIndexPatterns: []
+  # Hostnames http_post_url and http_post2_url may use; empty allows every host
+  allowedHttpHosts: []
+
+# Lets rules read credentials from Secrets labelled alerts.example.dev/allow-source=true
+# in their own namespace. Grants cluster-wide "get" on Secrets.
+secretRefs:
+  enabled: false
+  resync: 5m
 
 nodeSelector: {}
 
@@ -95,10 +108,32 @@ rbac:
   # Specifies whether RBAC resources should be created
   create: true
 
-# Metrics service configuration
+# Metrics are served over HTTPS and protected by TokenReview and SubjectAccessReview
 metrics:
   enabled: false
   port: 8443
+  service:
+    port: 8443
+  # Subjects (for example the Prometheus ServiceAccount) allowed to read /metrics
+  readerSubjects: []
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+    # The manager serves a self-signed certificate unless --metrics-cert-path is set
+    insecureSkipVerify: true
+
+networkPolicy:
+  enabled: false
+  # Egress to the Kubernetes API server; empty allows TCP 443 and 6443 to any address
+  apiServerCIDRs: []
+  # Peers allowed to scrape metrics, e.g. [{namespaceSelector: {matchLabels: {name: monitoring}}}]
+  metricsFrom: []
+
+# Only useful with more than one replica
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
 
 # Health probe configuration
 livenessProbe:

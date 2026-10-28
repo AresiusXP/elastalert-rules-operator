@@ -19,24 +19,31 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	alertsv1alpha1 "github.com/AresiusXP/elastalert-rules-operator/api/v1alpha1"
 	"github.com/AresiusXP/elastalert-rules-operator/internal/controller"
+	"github.com/AresiusXP/elastalert-rules-operator/internal/policy"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -44,159 +51,136 @@ var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 
-	// Version information (set by goreleaser at build time)
 	version = "dev"
 	commit  = "none"
 	date    = "unknown"
-	builtBy = "unknown"
 )
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
 	utilruntime.Must(alertsv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
-// nolint:gocyclo
-func main() {
-	var metricsAddr string
-	var metricsCertPath, metricsCertName, metricsCertKey string
-	var webhookCertPath, webhookCertName, webhookCertKey string
-	var enableLeaderElection bool
-	var probeAddr string
-	var secureMetrics bool
-	var enableHTTP2 bool
-	var tlsOpts []func(*tls.Config)
-	var showVersion bool
+type options struct {
+	metricsAddr          string
+	metricsCertPath      string
+	metricsCertName      string
+	metricsCertKey       string
+	probeAddr            string
+	enableLeaderElection bool
+	secureMetrics        bool
+	enableHTTP2          bool
+	showVersion          bool
 
-	flag.BoolVar(&showVersion, "version", false, "Show version information and exit")
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
+	allowedTargets       string
+	allowedSecretTargets string
+	allowedAlerters      string
+	allowedIndexPatterns string
+	allowedHTTPHosts     string
+	allowedExtraFields   string
+	enableSecretRefs     bool
+	secretResync         time.Duration
+	elastalertDeployment string
+}
+
+func (o *options) bind(fs *flag.FlagSet) {
+	fs.BoolVar(&o.showVersion, "version", false, "Show version information and exit")
+	fs.StringVar(&o.metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+	fs.StringVar(&o.probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	fs.BoolVar(&o.enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&secureMetrics, "metrics-secure", true,
+	fs.BoolVar(&o.secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
-	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
-	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
-	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
+	fs.StringVar(&o.metricsCertPath, "metrics-cert-path", "",
 		"The directory that contains the metrics server certificate.")
-	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
-	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
+	fs.StringVar(&o.metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
+	fs.StringVar(&o.metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
+	fs.BoolVar(&o.enableHTTP2, "enable-http2", false, "If set, HTTP/2 will be enabled for the metrics server")
+
+	fs.StringVar(&o.allowedTargets, "allowed-targets", "",
+		"Comma separated namespace/name list of ConfigMaps rules may write to. Rules targeting anything else are rejected.")
+	fs.StringVar(&o.allowedSecretTargets, "allowed-secret-targets", "",
+		"Comma separated namespace/name list of Secrets rules may write to.")
+	fs.StringVar(&o.allowedAlerters, "allowed-alerters", strings.Join(policy.DefaultAlerters, ","),
+		"Comma separated ElastAlert alerters rules may use.")
+	fs.StringVar(&o.allowedIndexPatterns, "allowed-index-patterns", "",
+		"Comma separated glob patterns rules may query. Empty allows every index.")
+	fs.StringVar(&o.allowedHTTPHosts, "allowed-http-hosts", "",
+		"Comma separated hostnames http_post_url and http_post2_url may use. Empty allows every host.")
+	fs.StringVar(&o.allowedExtraFields, "allowed-additional-fields", "",
+		"Comma separated extra ElastAlert settings additionalFields and secretRefs may use, on top of the built-in list.")
+	fs.BoolVar(&o.enableSecretRefs, "enable-secret-refs", false,
+		"Allow rules to read credentials from labelled Secrets in their own namespace through spec.secretRefs.")
+	fs.DurationVar(&o.secretResync, "secret-resync", 5*time.Minute,
+		"How often rules that depend on Secrets are re-rendered.")
+	fs.StringVar(&o.elastalertDeployment, "elastalert-deployment", "",
+		"namespace/name of the ElastAlert Deployment to restart when rules change. Empty disables rollouts.")
+}
+
+func main() {
+	var o options
+	o.bind(flag.CommandLine)
+	zapOpts := zap.Options{}
+	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	// Show version and exit if requested
-	if showVersion {
-		setupLog.Info("ElastAlert Rule Operator version information",
-			"version", version,
-			"commit", commit,
-			"buildDate", date,
-			"builtBy", builtBy,
-		)
+	if o.showVersion {
+		fmt.Printf("version=%s commit=%s buildDate=%s\n", version, commit, date)
 		os.Exit(0)
 	}
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
+	setupLog.Info("Starting ElastAlert Rules Operator", "version", version, "commit", commit, "buildDate", date)
 
-	setupLog.Info("Starting ElastAlert Rule Operator",
-		"version", version,
-		"commit", commit,
-		"buildDate", date,
-	)
-
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
+	pol, err := buildPolicy(&o)
+	if err != nil {
+		setupLog.Error(err, "invalid configuration")
+		os.Exit(1)
+	}
+	rollout, err := rolloutTarget(o.elastalertDeployment)
+	if err != nil {
+		setupLog.Error(err, "invalid configuration")
+		os.Exit(1)
 	}
 
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
+	var tlsOpts []func(*tls.Config)
+	if !o.enableHTTP2 {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) {
+			c.NextProtos = []string{"http/1.1"}
+		})
 	}
 
-	// Initial webhook TLS options
-	webhookTLSOpts := tlsOpts
-	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
-	}
-
-	if len(webhookCertPath) > 0 {
-		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
-
-		webhookServerOptions.CertDir = webhookCertPath
-		webhookServerOptions.CertName = webhookCertName
-		webhookServerOptions.KeyName = webhookCertKey
-	}
-
-	webhookServer := webhook.NewServer(webhookServerOptions)
-
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
-	// More info:
-	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.1/pkg/metrics/server
-	// - https://book.kubebuilder.io/reference/metrics.html
 	metricsServerOptions := metricsserver.Options{
-		BindAddress:   metricsAddr,
-		SecureServing: secureMetrics,
+		BindAddress:   o.metricsAddr,
+		SecureServing: o.secureMetrics,
 		TLSOpts:       tlsOpts,
 	}
-
-	if secureMetrics {
-		// FilterProvider is used to protect the metrics endpoint with authn/authz.
-		// These configurations ensure that only authorized users and service accounts
-		// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
-		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.1/pkg/metrics/filters#WithAuthenticationAndAuthorization
+	if o.secureMetrics {
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
-
-	// If the certificate is not specified, controller-runtime will automatically
-	// generate self-signed certificates for the metrics server. While convenient for development and testing,
-	// this setup is not recommended for production.
-	//
-	// To use cert-manager-managed certificates for the metrics server, mount the
-	// certificate into the container and pass --metrics-cert-path (and the
-	// matching cert/key names).
-	if len(metricsCertPath) > 0 {
+	if len(o.metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
-			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
-
-		metricsServerOptions.CertDir = metricsCertPath
-		metricsServerOptions.CertName = metricsCertName
-		metricsServerOptions.KeyName = metricsCertKey
+			"metrics-cert-path", o.metricsCertPath, "metrics-cert-name", o.metricsCertName, "metrics-cert-key", o.metricsCertKey)
+		metricsServerOptions.CertDir = o.metricsCertPath
+		metricsServerOptions.CertName = o.metricsCertName
+		metricsServerOptions.KeyName = o.metricsCertKey
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
+		HealthProbeBindAddress: o.probeAddr,
+		LeaderElection:         o.enableLeaderElection,
 		LeaderElectionID:       "dd789420.example.dev",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		Cache:                  cacheOptions(pol),
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{&corev1.Secret{}, &corev1.ConfigMap{}, &appsv1.Deployment{}},
+			},
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -204,9 +188,14 @@ func main() {
 	}
 
 	if err := (&controller.ElastAlertRuleReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("elastalertrule-controller"),
+		Client:           mgr.GetClient(),
+		APIReader:        mgr.GetAPIReader(),
+		Scheme:           mgr.GetScheme(),
+		Recorder:         mgr.GetEventRecorder("elastalertrule-controller"),
+		Policy:           pol,
+		Rollout:          rollout,
+		EnableSecretRefs: o.enableSecretRefs,
+		SecretResync:     o.secretResync,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ElastAlertRule")
 		os.Exit(1)
@@ -222,9 +211,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager")
+	setupLog.Info("starting manager", "configMapTargets", len(pol.Namespaces(alertsv1alpha1.TargetKindConfigMap)),
+		"secretRefs", o.enableSecretRefs, "rollout", rollout != nil)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func buildPolicy(o *options) (policy.Policy, error) {
+	cms, err := policy.ParseTargets(alertsv1alpha1.TargetKindConfigMap, o.allowedTargets)
+	if err != nil {
+		return policy.Policy{}, fmt.Errorf("--allowed-targets: %w", err)
+	}
+	secrets, err := policy.ParseTargets(alertsv1alpha1.TargetKindSecret, o.allowedSecretTargets)
+	if err != nil {
+		return policy.Policy{}, fmt.Errorf("--allowed-secret-targets: %w", err)
+	}
+	return policy.New(append(cms, secrets...),
+		policy.SplitList(o.allowedAlerters),
+		policy.SplitList(o.allowedIndexPatterns),
+		policy.SplitList(o.allowedHTTPHosts),
+		policy.SplitList(o.allowedExtraFields)...), nil
+}
+
+// rolloutTarget parses --elastalert-deployment, falling back to the legacy
+// ELASTALERT_ROLLOUT_ENABLED environment variables.
+func rolloutTarget(flagValue string) (*types.NamespacedName, error) {
+	if flagValue == "" && os.Getenv("ELASTALERT_ROLLOUT_ENABLED") == "true" {
+		name, ns := os.Getenv("ELASTALERT_DEPLOYMENT_NAME"), os.Getenv("ELASTALERT_DEPLOYMENT_NAMESPACE")
+		if name != "" && ns != "" {
+			flagValue = ns + "/" + name
+		}
+	}
+	if flagValue == "" {
+		return nil, nil
+	}
+	ns, name, ok := strings.Cut(flagValue, "/")
+	if !ok || ns == "" || name == "" {
+		return nil, fmt.Errorf("--elastalert-deployment %q must be namespace/name", flagValue)
+	}
+	return &types.NamespacedName{Namespace: ns, Name: name}, nil
+}
+
+// cacheOptions limits the ConfigMap cache to the namespaces that hold targets.
+func cacheOptions(pol policy.Policy) cache.Options {
+	byObject := map[client.Object]cache.ByObject{}
+	if namespaces := pol.Namespaces(alertsv1alpha1.TargetKindConfigMap); len(namespaces) > 0 {
+		cfgs := make(map[string]cache.Config, len(namespaces))
+		for _, ns := range namespaces {
+			cfgs[ns] = cache.Config{}
+		}
+		byObject[&corev1.ConfigMap{}] = cache.ByObject{Namespaces: cfgs}
+	}
+	return cache.Options{ByObject: byObject}
 }

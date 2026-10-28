@@ -58,3 +58,36 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Targets grouped by namespace as JSON: {"<ns>": {"ConfigMap": [names], "Secret": [names]}}
+*/}}
+{{- define "elastalert-rules-operator.targetsByNamespace" -}}
+{{- $byNs := dict -}}
+{{- range .Values.targets -}}
+{{- $ns := default $.Release.Namespace .namespace -}}
+{{- $kind := default "ConfigMap" .kind -}}
+{{- $entry := get $byNs $ns | default (dict "ConfigMap" (list) "Secret" (list)) -}}
+{{- $_ := set $entry $kind (append (get $entry $kind) .name) -}}
+{{- $_ := set $byNs $ns $entry -}}
+{{- end -}}
+{{- toJson $byNs -}}
+{{- end }}
+
+{{/*
+Comma separated namespace/name list for one target kind
+*/}}
+{{- define "elastalert-rules-operator.targetList" -}}
+{{- $kind := .kind -}}
+{{- $items := list -}}
+{{- range .root.Values.targets -}}
+{{- if eq (default "ConfigMap" .kind) $kind -}}
+{{- $items = append $items (printf "%s/%s" (default $.root.Release.Namespace .namespace) .name) -}}
+{{- end -}}
+{{- end -}}
+{{- join "," $items -}}
+{{- end }}
+
+{{- define "elastalert-rules-operator.rolloutNamespace" -}}
+{{- default .Release.Namespace .Values.elastalert.deploymentNamespace -}}
+{{- end }}

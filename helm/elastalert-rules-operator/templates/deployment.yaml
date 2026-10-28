@@ -36,22 +36,44 @@ spec:
           args:
             - --leader-elect
             - --health-probe-bind-address=:8081
+            {{- if .Values.metrics.enabled }}
+            - --metrics-bind-address=:{{ .Values.metrics.port }}
+            {{- else }}
+            - --metrics-bind-address=0
+            {{- end }}
+            {{- $cms := include "elastalert-rules-operator.targetList" (dict "root" . "kind" "ConfigMap") }}
+            {{- if $cms }}
+            - --allowed-targets={{ $cms }}
+            {{- end }}
+            {{- $secrets := include "elastalert-rules-operator.targetList" (dict "root" . "kind" "Secret") }}
+            {{- if $secrets }}
+            - --allowed-secret-targets={{ $secrets }}
+            {{- end }}
+            - --allowed-alerters={{ join "," .Values.policy.allowedAlerters }}
+            {{- if .Values.policy.allowedIndexPatterns }}
+            - --allowed-index-patterns={{ join "," .Values.policy.allowedIndexPatterns }}
+            {{- end }}
+            {{- if .Values.policy.allowedHttpHosts }}
+            - --allowed-http-hosts={{ join "," .Values.policy.allowedHttpHosts }}
+            {{- end }}
+            {{- if .Values.policy.allowedAdditionalFields }}
+            - --allowed-additional-fields={{ join "," .Values.policy.allowedAdditionalFields }}
+            {{- end }}
+            {{- if .Values.secretRefs.enabled }}
+            - --enable-secret-refs
+            - --secret-resync={{ .Values.secretRefs.resync }}
+            {{- end }}
+            {{- if .Values.elastalert.enabled }}
+            - --elastalert-deployment={{ include "elastalert-rules-operator.rolloutNamespace" . }}/{{ .Values.elastalert.deploymentName }}
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.env }}
           env:
-            {{- if .Values.elastalert.enabled }}
-            - name: ELASTALERT_ROLLOUT_ENABLED
-              value: "true"
-            - name: ELASTALERT_DEPLOYMENT_NAME
-              value: {{ .Values.elastalert.deploymentName | quote }}
-            - name: ELASTALERT_DEPLOYMENT_NAMESPACE
-              value: {{ .Values.elastalert.deploymentNamespace | quote }}
-            {{- end }}
-            {{- if .Values.env }}
-            {{- toYaml .Values.env | nindent 12 }}
-            {{- end }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             {{- if .Values.metrics.enabled }}
             - name: metrics
