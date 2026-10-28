@@ -20,8 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/yaml"
 )
 
 // ToElastAlertYAML converts the ElastAlertRule spec to ElastAlert YAML format.
