@@ -46,6 +46,7 @@ wait_for_key_removed() {
 }
 
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+kubectl label --overwrite namespace "${NAMESPACE}" pod-security.kubernetes.io/enforce=restricted
 kubectl create configmap "${TARGET_CONFIGMAP}" -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
 helm upgrade --install "${RELEASE}" "${CHART}" \
@@ -74,6 +75,73 @@ kubectl wait --for=condition=Ready "elastalertrule/${RULE_NAME}" -n "${NAMESPACE
 
 echo "Asserting rule key present in ConfigMap ${TARGET_CONFIGMAP}"
 wait_for_key || { echo "no .yaml key containing ${RULE_NAME} found" >&2; exit 1; }
+configmap_keys | grep -qx "${NAMESPACE}_${RULE_NAME}.yaml" || { echo "expected key ${NAMESPACE}_${RULE_NAME}.yaml" >&2; exit 1; }
+
+condition_reason() {
+  kubectl get elastalertrule "$1" -n "${NAMESPACE}" \
+    -o jsonpath='{.status.conditions[?(@.type=="ValidationFailed")].reason}'
+}
+
+wait_for_reason() {
+  local deadline=$((SECONDS + 60))
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
+    if [ "$(condition_reason "$1")" = "$2" ]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "rule $1 never reported ValidationFailed=$2 (got '$(condition_reason "$1")')" >&2
+  return 1
+}
+
+echo "Asserting a target outside the allowlist is refused"
+kubectl create namespace e2e-other --dry-run=client -o yaml | kubectl apply -f -
+kubectl create configmap victim -n e2e-other --from-literal=keep=me --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -n "${NAMESPACE}" -f - <<YAML
+apiVersion: alerts.example.dev/v1alpha1
+kind: ElastAlertRule
+metadata:
+  name: e2e-forbidden-target
+spec:
+  type: any
+  index: logs-*
+  targetConfigMap:
+    name: victim
+    namespace: e2e-other
+YAML
+wait_for_reason e2e-forbidden-target TargetNotAllowed
+[ "$(kubectl get configmap victim -n e2e-other -o json | jq -c '.data')" = '{"keep":"me"}' ] ||
+  { echo "victim ConfigMap was modified" >&2; exit 1; }
+
+echo "Asserting an alerter outside the allowlist is refused"
+kubectl apply -n "${NAMESPACE}" -f - <<YAML
+apiVersion: alerts.example.dev/v1alpha1
+kind: ElastAlertRule
+metadata:
+  name: e2e-command-alerter
+spec:
+  type: any
+  index: logs-*
+  alert: [command]
+YAML
+wait_for_reason e2e-command-alerter PolicyViolation
+configmap_keys | grep -q 'e2e-command-alerter' && { echo "rejected rule was written" >&2; exit 1; }
+
+echo "Asserting the API server rejects unknown rule types"
+if kubectl apply -n "${NAMESPACE}" -f - <<YAML
+apiVersion: alerts.example.dev/v1alpha1
+kind: ElastAlertRule
+metadata:
+  name: e2e-custom-type
+spec:
+  type: my_module.MyRule
+  index: logs-*
+YAML
+then
+  echo "custom rule type was admitted" >&2
+  exit 1
+fi
+kubectl delete elastalertrule e2e-forbidden-target e2e-command-alerter -n "${NAMESPACE}" --timeout=120s
 
 kubectl delete elastalertrule "${RULE_NAME}" -n "${NAMESPACE}" --timeout=120s
 

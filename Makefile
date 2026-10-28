@@ -61,6 +61,12 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./... -coverprofile cover.out
 
+.PHONY: test-e2e
+test-e2e: ## Run the end-to-end script against the current kube context (Kind recommended)
+	docker build -t elastalert-rules-operator:e2e .
+	kind load docker-image elastalert-rules-operator:e2e
+	.github/e2e/e2e.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	$(GOLANGCI_LINT) run
