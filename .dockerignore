@@ -1,0 +1,35 @@
+# More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
+
+# Ignore build and test artifacts
+bin/
+testbin/
+cover.out
+*.test
+
+# Ignore test files
+**/*_test.go
+**/testdata/
+
+# Ignore version control
+.git/
+.gitignore
+
+# Ignore documentation
+*.md
+!README.md
+
+# Ignore config directories we don't need
+config/
+hack/
+test/
+
+# Ignore IDE files
+.vscode/
+.idea/
+
+# But keep these essential files
+!go.mod
+!go.sum
+!cmd/
+!api/
+!internal/

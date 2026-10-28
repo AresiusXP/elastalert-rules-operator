@@ -1,0 +1,279 @@
+/*
+Copyright 2025 Patricio Danos.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
+// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+
+// TargetConfigMap defines the ConfigMap where the ElastAlert rule should be written
+type TargetConfigMap struct {
+	// Name of the target ConfigMap
+	// +kubebuilder:default="elastalert-rules"
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Namespace of the target ConfigMap. Defaults to the CR namespace if not specified
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// ElastAlertRuleSpec defines the desired state of ElastAlertRule
+// Fields are named to match ElastAlert's YAML format for consistency
+type ElastAlertRuleSpec struct {
+	// Type is the ElastAlert rule type (e.g., "frequency", "any", "spike", "flatline", "new_term", "cardinality")
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Type string `json:"type"`
+
+	// Index is the OpenSearch/Elasticsearch index pattern to query
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Index string `json:"index"`
+
+	// Filter is the query filter as a list of filter clauses
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	Filter []runtime.RawExtension `json:"filter,omitempty"`
+
+	// Timeframe is the time window for rule evaluation
+	// Can be specified as an object (e.g., {minutes: 5}, {hours: 1}) or string (e.g., "5m", "1h")
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	Timeframe *runtime.RawExtension `json:"timeframe,omitempty"`
+
+	// NumEvents is the number of events to trigger the alert (used by frequency rule type)
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	NumEvents *int `json:"num_events,omitempty"`
+
+	// QueryKey is the field to group by
+	// +optional
+	QueryKey string `json:"query_key,omitempty"`
+
+	// AlertText is the text to include in the alert
+	// +optional
+	AlertText string `json:"alert_text,omitempty"`
+
+	// AlertTextArgs are the fields to use in alert_text formatting
+	// +optional
+	AlertTextArgs []string `json:"alert_text_args,omitempty"`
+
+	// Alert is the list of alerters to use (e.g., ["email"], ["opsgenie"])
+	// +optional
+	Alert []string `json:"alert,omitempty"`
+
+	// Realert defines the minimum time between alerts
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	Realert *runtime.RawExtension `json:"realert,omitempty"`
+
+	// ExponentialRealert defines exponential backoff for realerting
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	ExponentialRealert *runtime.RawExtension `json:"exponential_realert,omitempty"`
+
+	// Include is the list of fields to include in alerts
+	// +optional
+	Include []string `json:"include,omitempty"`
+
+	// OpsgenieKey is the Opsgenie API key
+	// +optional
+	OpsgenieKey string `json:"opsgenie_key,omitempty"`
+
+	// OpsgenieMessage is the Opsgenie alert message
+	// +optional
+	OpsgenieMessage string `json:"opsgenie_message,omitempty"`
+
+	// OpsgeniePriority is the Opsgenie alert priority (P1-P5)
+	// +optional
+	OpsgeniePriority string `json:"opsgenie_priority,omitempty"`
+
+	// OpsgenieTags are the tags to add to Opsgenie alerts
+	// +optional
+	OpsgenieTags []string `json:"opsgenie_tags,omitempty"`
+
+	// OpsgenieTeams are the Opsgenie teams to notify
+	// +optional
+	OpsgenieTeams []string `json:"opsgenie_teams,omitempty"`
+
+	// HTTPPostURL is the URL to POST alerts to
+	// +optional
+	HTTPPostURL string `json:"http_post_url,omitempty"`
+
+	// HTTPPostPayload defines the payload structure for HTTP POST alerts
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	HTTPPostPayload *runtime.RawExtension `json:"http_post_payload,omitempty"`
+
+	// HTTPPostHeaders defines headers for HTTP POST alerts
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	HTTPPostHeaders *runtime.RawExtension `json:"http_post_headers,omitempty"`
+
+	// BufferTime is the time buffer for queries (percentage_match, metric aggregation rules)
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	BufferTime *runtime.RawExtension `json:"buffer_time,omitempty"`
+
+	// BucketInterval is the time bucket interval for percentage calculation (percentage_match rules)
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	BucketInterval *runtime.RawExtension `json:"bucket_interval,omitempty"`
+
+	// MinDenominator is the minimum number of documents for percentage calculation (percentage_match rules)
+	// +optional
+	MinDenominator *int `json:"min_denominator,omitempty"`
+
+	// MinPercentage is the minimum percentage threshold to trigger alert (percentage_match rules)
+	// +optional
+	MinPercentage *int `json:"min_percentage,omitempty"`
+
+	// MatchBucketFilter defines the filter for the match bucket in percentage calculations (percentage_match rules)
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +optional
+	MatchBucketFilter []runtime.RawExtension `json:"match_bucket_filter,omitempty"`
+
+	// Fields is the list of fields to monitor (new_term rules)
+	// +optional
+	Fields []string `json:"fields,omitempty"`
+
+	// Name is the rule name (optional, defaults to <name>)
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// TargetConfigMap specifies where to write the rule
+	// +optional
+	TargetConfigMap TargetConfigMap `json:"targetConfigMap,omitempty"`
+
+	// KeyName is the ConfigMap key name. Defaults to "<name>.yaml"
+	// +kubebuilder:validation:Pattern=`^[^/]+$`
+	// +optional
+	KeyName string `json:"keyName,omitempty"`
+
+	// AdditionalFields allows specifying any other ElastAlert fields not explicitly defined above
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Type=object
+	// +optional
+	AdditionalFields *runtime.RawExtension `json:"additionalFields,omitempty"`
+}
+
+// ElastAlertRuleStatus defines the observed state of ElastAlertRule.
+type ElastAlertRuleStatus struct {
+	// Conditions represent the current state of the ElastAlertRule resource.
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// ObservedConfigMapResourceVersion is the last observed resource version of the target ConfigMap
+	// +optional
+	ObservedConfigMapResourceVersion string `json:"observedConfigMapResourceVersion,omitempty"`
+
+	// LastReconciled is the timestamp of the last successful reconciliation
+	// +optional
+	LastReconciled *metav1.Time `json:"lastReconciled,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=ear
+// +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
+// +kubebuilder:printcolumn:name="Index",type=string,JSONPath=`.spec.index`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// ElastAlertRule is the Schema for the elastalertrules API
+type ElastAlertRule struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// metadata is a standard object metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty,omitzero"`
+
+	// spec defines the desired state of ElastAlertRule
+	// +required
+	Spec ElastAlertRuleSpec `json:"spec"`
+
+	// status defines the observed state of ElastAlertRule
+	// +optional
+	Status ElastAlertRuleStatus `json:"status,omitempty,omitzero"`
+}
+
+// +kubebuilder:object:root=true
+
+// ElastAlertRuleList contains a list of ElastAlertRule
+type ElastAlertRuleList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ElastAlertRule `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&ElastAlertRule{}, &ElastAlertRuleList{})
+}
+
+// Condition types
+const (
+	// ConditionTypeReady indicates the rule has been successfully written to the ConfigMap
+	ConditionTypeReady = "Ready"
+	// ConditionTypeValidationFailed indicates the rule spec failed validation
+	ConditionTypeValidationFailed = "ValidationFailed"
+	// ConditionTypeError indicates an error occurred during reconciliation
+	ConditionTypeError = "Error"
+)
+
+// Finalizer name
+const (
+	FinalizerName = "alerts.example.dev/finalizer"
+)
+
+// GetConfigMapName returns the target ConfigMap name, defaulting to "elastalert-rules"
+func (r *ElastAlertRule) GetConfigMapName() string {
+	if r.Spec.TargetConfigMap.Name != "" {
+		return r.Spec.TargetConfigMap.Name
+	}
+	return "elastalert-rules"
+}
+
+// GetConfigMapNamespace returns the target ConfigMap namespace, defaulting to the CR namespace
+func (r *ElastAlertRule) GetConfigMapNamespace() string {
+	if r.Spec.TargetConfigMap.Namespace != "" {
+		return r.Spec.TargetConfigMap.Namespace
+	}
+	return r.Namespace
+}
+
+// GetKeyName returns the ConfigMap key name, defaulting to "<name>.yaml"
+func (r *ElastAlertRule) GetKeyName() string {
+	if r.Spec.KeyName != "" {
+		return r.Spec.KeyName
+	}
+	return r.Name + ".yaml"
+}
+
+// GetRuleName returns the ElastAlert rule name, using spec.name if set, otherwise "<name>"
+func (r *ElastAlertRule) GetRuleName() string {
+	if r.Spec.Name != "" {
+		return r.Spec.Name
+	}
+	return r.Name
+}

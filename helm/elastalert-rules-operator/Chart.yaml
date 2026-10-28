@@ -1,0 +1,17 @@
+apiVersion: v2
+name: elastalert-rules-operator
+description: A Kubernetes operator for managing ElastAlert rules via CRD
+type: application
+version: 0.6.0
+appVersion: 0.6.0
+keywords:
+  - elastalert
+  - opensearch
+  - elasticsearch
+  - alerts
+  - operator
+maintainers:
+  - name: Patricio Danos
+home: https://github.com/AresiusXP/elastalert-rules-operator
+sources:
+  - https://github.com/AresiusXP/elastalert-rules-operator
