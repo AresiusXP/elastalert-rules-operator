@@ -83,7 +83,7 @@ The ElastAlert Rules Operator simplifies the management of ElastAlert rules in K
 - Kubernetes cluster (v1.25+)
 - Helm 3.8+ (for OCI installs)
 - kubectl configured
-- Go 1.26+ (for development)
+- Go 1.27+ (for development)
 - kubebuilder 3.0+ (for development)
 
 **Important**: Target ConfigMaps and Secrets must exist before rules reference them, and each one must be listed in the chart's `targets` value. The operator never creates targets and refuses to write anywhere else.
