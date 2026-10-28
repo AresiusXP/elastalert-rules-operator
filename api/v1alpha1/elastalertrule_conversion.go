@@ -33,41 +33,57 @@ import (
 // error rather than silently dropped, so the controller can surface it as a
 // status condition.
 func (r *ElastAlertRule) ToElastAlertYAML() (string, error) {
-	// Build the rule map
-	rule := make(map[string]interface{})
+	return r.RenderRule(nil)
+}
 
-	// Always set the name
-	rule["name"] = r.GetRuleName()
+// RenderRule renders the rule like ToElastAlertYAML. resolved holds the values
+// for spec.secretRefs, keyed by field; every secretRef must have an entry.
+func (r *ElastAlertRule) RenderRule(resolved map[string]interface{}) (string, error) {
+	rule, err := r.BuildRule(resolved)
+	if err != nil {
+		return "", err
+	}
+	return MarshalRule(rule)
+}
 
-	// Required fields
-	rule["type"] = r.Spec.Type
-	rule["index"] = r.Spec.Index
-
-	// Add optional fields
-	if err := r.addOptionalFields(rule); err != nil {
-		return "", err
-	}
-	r.addOpsgenieFields(rule)
-	if err := r.addHTTPPostFields(rule); err != nil {
-		return "", err
-	}
-	if err := r.addPercentageMatchFields(rule); err != nil {
-		return "", err
-	}
-	if err := r.addFilterField(rule); err != nil {
-		return "", err
-	}
-	if err := r.addAdditionalFields(rule); err != nil {
-		return "", err
-	}
-
-	// Convert to YAML
+// MarshalRule renders a rule map as YAML.
+func MarshalRule(rule map[string]interface{}) (string, error) {
 	yamlBytes, err := yaml.Marshal(rule)
 	if err != nil {
 		return "", err
 	}
-
 	return string(yamlBytes), nil
+}
+
+// BuildRule assembles the final rule map: typed fields, resolved secret refs
+// and additionalFields. Conflicting keys are an error.
+func (r *ElastAlertRule) BuildRule(resolved map[string]interface{}) (map[string]interface{}, error) {
+	rule := make(map[string]interface{})
+
+	rule["name"] = r.GetRuleName()
+	rule["type"] = r.Spec.Type
+	rule["index"] = r.Spec.Index
+
+	if err := r.addOptionalFields(rule); err != nil {
+		return nil, err
+	}
+	r.addOpsgenieFields(rule)
+	if err := r.addHTTPPostFields(rule); err != nil {
+		return nil, err
+	}
+	if err := r.addPercentageMatchFields(rule); err != nil {
+		return nil, err
+	}
+	if err := r.addFilterField(rule); err != nil {
+		return nil, err
+	}
+	if err := r.addSecretRefFields(rule, resolved); err != nil {
+		return nil, err
+	}
+	if err := r.addAdditionalFields(rule); err != nil {
+		return nil, err
+	}
+	return rule, nil
 }
 
 // decodeRawExtension decodes a RawExtension's JSON payload into a generic value.
@@ -253,10 +269,37 @@ func (r *ElastAlertRule) addAdditionalFields(rule map[string]interface{}) error 
 		return fmt.Errorf("invalid additionalFields: %w", err)
 	}
 	for k, v := range additional {
-		// Don't override core fields
-		if _, exists := rule[k]; !exists {
-			rule[k] = v
+		if _, exists := rule[k]; exists {
+			return fmt.Errorf("additionalFields key %q conflicts with a field already set by the spec", k)
 		}
+		rule[k] = v
 	}
 	return nil
+}
+
+// addSecretRefFields sets the fields backed by Secret values.
+func (r *ElastAlertRule) addSecretRefFields(rule, resolved map[string]interface{}) error {
+	for _, ref := range r.Spec.SecretRefs {
+		value, ok := resolved[ref.Field]
+		if !ok {
+			return fmt.Errorf("secretRef for field %q was not resolved", ref.Field)
+		}
+		if _, exists := rule[ref.Field]; exists {
+			return fmt.Errorf("secretRef field %q conflicts with a field already set by the spec", ref.Field)
+		}
+		rule[ref.Field] = value
+	}
+	return nil
+}
+
+// AdditionalFieldsMap decodes spec.additionalFields.
+func (r *ElastAlertRule) AdditionalFieldsMap() (map[string]interface{}, error) {
+	if r.Spec.AdditionalFields == nil || len(r.Spec.AdditionalFields.Raw) == 0 {
+		return nil, nil
+	}
+	var additional map[string]interface{}
+	if err := json.Unmarshal(r.Spec.AdditionalFields.Raw, &additional); err != nil {
+		return nil, fmt.Errorf("invalid additionalFields: %w", err)
+	}
+	return additional, nil
 }

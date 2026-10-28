@@ -24,24 +24,28 @@ A Kubernetes operator that manages ElastAlert rules via Custom Resource Definiti
 The ElastAlert Rules Operator simplifies the management of ElastAlert rules in Kubernetes by:
 
 - **Declarative Rule Management**: Define ElastAlert rules as Kubernetes custom resources
-- **Automatic ConfigMap Sync**: Rules are automatically written to a pre-existing ConfigMap
-- **Namespace Isolation**: Each rule is isolated by namespace
-- **Validation**: Built-in validation ensures rules are correctly formatted before deployment
-- **Optional Deployment Rollout**: Automatically trigger ElastAlert pod restarts when rules change
-- **Merge Strategy**: Preserves existing ConfigMap keys when managing multiple rules
+- **Automatic Sync**: Rules are written to a pre-existing ConfigMap or Secret with server-side apply, one field manager per rule
+- **Allowlisted Targets**: The operator only writes to targets listed at install time, and its RBAC is generated for exactly those objects
+- **Rule Policy**: Built-in rule types only, an alerter allowlist, and a blocklist for fields that run commands or redirect ElastAlert
+- **Secrets Stay Secret**: Credentials can be injected from labelled Secrets instead of living in the resource
+- **Validation**: The CRD schema (including CEL rules) rejects bad rules at `kubectl apply` time
+- **Optional Deployment Rollout**: Annotate the ElastAlert Deployment to restart it when rules change
 
 ## Features
 
 - ✅ CRD-based rule management
-- ✅ Automatic ConfigMap reconciliation
+- ✅ Server-side-apply reconciliation with per-rule key ownership and conflict reporting
+- ✅ Target allowlist with generated least-privilege RBAC
+- ✅ Rule policy: rule types, alerters, blocked fields, optional index and host allowlists
+- ✅ Secret references for credentials
 - ✅ Finalizer-based cleanup on deletion
 - ✅ Status conditions for observability
 - ✅ Support for all ElastAlert rule types (frequency, spike, flatline, any, etc.)
 - ✅ Native support for Opsgenie, email, and other alerters
 - ✅ Field names match ElastAlert YAML format
 - ✅ Optional automatic deployment rollout
-- ✅ Comprehensive validation
-- ✅ Unit and integration tests
+- ✅ Schema and CEL validation at admission time
+- ✅ Unit and envtest tests, signed releases with SBOM and provenance
 
 ## Architecture
 
@@ -57,9 +61,9 @@ The ElastAlert Rules Operator simplifies the management of ElastAlert rules in K
 │  Operator/Controller│─────▶│   ConfigMap      │
 │                     │      │  (elastalert-    │
 │  - Validates spec   │      │   rules)         │
-│  - Converts to YAML │      │                  │
-│  - Manages keys     │      │ Data:            │
-│  - Updates status   │      │   name.yaml      │
+│  - Applies policy   │      │                  │
+│  - Server-side apply│      │ Data:            │
+│  - Updates status   │      │ <ns>_<name>.yaml │
 └─────────────────────┘      └────────┬─────────┘
                                       │
                                       │ Mounted as volume
@@ -77,29 +81,28 @@ The ElastAlert Rules Operator simplifies the management of ElastAlert rules in K
 ### Prerequisites
 
 - Kubernetes cluster (v1.25+)
+- Helm 3.8+ (for OCI installs)
 - kubectl configured
 - Go 1.26+ (for development)
 - kubebuilder 3.0+ (for development)
 
-**Important**: The operator requires that ConfigMaps be pre-created before ElastAlertRules can reference them. This ensures proper configuration management and prevents accidental ConfigMap creation.
+**Important**: Target ConfigMaps and Secrets must exist before rules reference them, and each one must be listed in the chart's `targets` value. The operator never creates targets and refuses to write anywhere else.
 
 ### Quick Start
 
 1. **Install the operator using Helm:**
 
 ```bash
-# Install the Helm chart
-helm install elastalert-rules-operator helm/elastalert-rules-operator
-
-# Or from GHCR
 helm install elastalert-rules-operator \
   oci://ghcr.io/aresiusxp/charts/elastalert-rules-operator \
-  --namespace elastalert-rules-operator-system --create-namespace
+  --namespace elastalert-rules-operator-system --create-namespace \
+  --set 'targets[0].name=elastalert-rules' \
+  --set 'targets[0].namespace=logging'
 
-# Or from your own registry
+# Or from a local checkout
 helm install elastalert-rules-operator helm/elastalert-rules-operator \
-  --set image.repository=<your-registry>/elastalert-rules-operator \
-  --set image.tag=latest
+  --namespace elastalert-rules-operator-system --create-namespace \
+  --set 'targets[0].name=elastalert-rules' --set 'targets[0].namespace=logging'
 ```
 
 2. **Create the target ConfigMap:**
@@ -221,7 +224,6 @@ spec:
     - message
     - stack_trace
   name: '[team-platform|checkout-service] Error in checkout service'
-  opsgenie_key: your-opsgenie-api-key
   opsgenie_message: '[team-platform|checkout-service] Error detected'
   opsgenie_priority: P3
   opsgenie_tags:
@@ -233,8 +235,9 @@ spec:
     minutes: 5
   targetConfigMap:
     name: elastalert-rules
-    namespace: default
 ```
+
+The Opsgenie API key is not part of the rule. Set it in ElastAlert's global configuration, or inject it with `secretRefs` as shown in [Secrets](#secrets).
 
 ### HTTP POST Alerter Example
 
@@ -255,14 +258,11 @@ spec:
   alert:
     - post
   http_post_url: https://api.opsgenie.com/v2/heartbeats/elastalert/ping
-  http_post_headers:
-    Authorization: "GenieKey your-api-key"
   http_post_payload:
     _type: type
   name: '[monitoring] ElastAlert heartbeat'
   targetConfigMap:
     name: elastalert-rules
-    namespace: default
 ```
 
 ### Percentage Match Example
@@ -298,7 +298,6 @@ spec:
     - percentage
   alert:
     - opsgenie
-  opsgenie_key: your-api-key
   opsgenie_message: 'High error rate detected for target {request_X-Target-Id}: Only {percentage}% of requests succeeded in the last 15 minutes'
   opsgenie_priority: P4
   opsgenie_tags:
@@ -310,7 +309,6 @@ spec:
   name: '[team-platform|prod] API high fail rate alert'
   targetConfigMap:
     name: elastalert-rules
-    namespace: default
 ```
 
 ### Spike Detection Example
@@ -346,7 +344,7 @@ spec:
 
 ### Custom ConfigMap and Key Names
 
-You can specify a different ConfigMap name and even a different namespace. This allows centralized rule management or cross-namespace configurations:
+You can point a rule at a different target and namespace, as long as that target is in the operator's allowlist. This allows centralized rule management:
 
 ```yaml
 apiVersion: alerts.example.dev/v1alpha1
@@ -363,7 +361,58 @@ spec:
   keyName: custom-rule-name.yaml    # Custom key name in ConfigMap
 ```
 
-**Note**: If `targetConfigMap.namespace` is not specified, the operator looks for the ConfigMap in the same namespace as the ElastAlertRule. The operator's namespace is never used for ConfigMap lookup.
+**Note**: If `targetConfigMap.namespace` is not specified, the target is looked up in the rule's namespace. A target that is not on the allowlist makes the rule fail with `TargetNotAllowed`, and nothing is written.
+
+### Secrets
+
+Keep credentials out of the resource: store them in a Secret, label it, and reference it. The rule then has to target a `Secret` (the rendered rule contains the credential), and the operator must run with `secretRefs.enabled=true`.
+
+```bash
+kubectl create secret generic opsgenie -n logging --from-literal=key=<api-key>
+kubectl label secret opsgenie -n logging alerts.example.dev/allow-source=true
+```
+
+```yaml
+apiVersion: alerts.example.dev/v1alpha1
+kind: ElastAlertRule
+metadata:
+  name: error-alert
+  namespace: logging
+spec:
+  type: any
+  index: app-logs-*
+  alert: [opsgenie]
+  opsgenie_message: Error detected
+  targetConfigMap:
+    kind: Secret
+    name: elastalert-rule-secrets
+  secretRefs:
+    - field: opsgenie_key
+      name: opsgenie
+      key: key
+    - field: http_post_headers
+      name: opsgenie
+      key: headers
+      format: yaml
+```
+
+Secrets are read only from the rule's namespace, only with the `alerts.example.dev/allow-source=true` label, and never when the Secret is itself a write target. Rules that still carry credentials inline get a `PlaintextCredentials` condition.
+
+## Security Model
+
+| Risk | Control |
+|------|---------|
+| A rule writes to an arbitrary ConfigMap (for example `kube-system/aws-auth`) | Only targets in `--allowed-targets` and `--allowed-secret-targets` are accepted. The generated RBAC covers exactly those objects, in their namespaces only. |
+| A rule makes ElastAlert run commands, load code or talk to another cluster | `type` must be a built-in rule type. Alerters must be on `--allowed-alerters` (default: opsgenie, post, slack, msteams, email, alertmanager, debug; `post2` is off because ElastAlert renders its payload with an unsandboxed Jinja template). `additionalFields` and `secretRefs` only accept a built-in list of safe settings plus `--allowed-additional-fields`; `command`, `pipe_*`, `import`, `match_enhancements`, `es_*`, the `timestamp_*` expression settings, TLS settings, proxies, `rules_folder` and `alert_text_type` are always rejected. |
+| One rule overwrites another | Default keys are `<namespace>_<name>.yaml`. Each rule applies with its own server-side-apply field manager, so key collisions surface as `KeyConflict`. Duplicate ElastAlert rule names are rejected (`DuplicateRuleName`). |
+| Credentials in the spec or ConfigMap | `secretRefs` and Secret targets. |
+| Reading arbitrary indices or posting to arbitrary hosts | Optional `--allowed-index-patterns` and `--allowed-http-hosts`. Host checks run on the final rule, including URLs that come from Secrets. |
+| A rule that stops being acceptable keeps running | Rules that fail validation or policy are withdrawn from the target. A rule's target cannot be changed after creation. |
+| Excess privileges | No cluster-wide write access to ConfigMaps or Deployments. Secret `get` is cluster-wide only when `secretRefs.enabled=true`. |
+
+`blacklist` and `whitelist` entries may not use `!file`, and `alert_text_args` and `alert_subject_args` may not name ElastAlert settings, because ElastAlert falls back to rule and global configuration for names that are missing from an event. Error messages never include rejected values.
+
+**Residual risk.** The policy is a default-deny filter in front of a powerful engine, not a sandbox. Anyone who can create an `ElastAlertRule` can still make ElastAlert query the allowed indices and post alert content to the allowed hosts, so restrict who may create rules and set the index and host allowlists on shared clusters. Add settings to `--allowed-additional-fields` only after checking ElastAlert's code for template rendering, `eval` or file access. Also harden the ElastAlert pod itself: no credentials in its global configuration beyond what it needs, a read-only root filesystem, a NetworkPolicy, and a restricted ServiceAccount.
 
 ## CRD Specification
 
@@ -373,7 +422,7 @@ spec:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `type` | string | Yes | ElastAlert rule type (frequency, any, spike, flatline, new_term, cardinality, etc.) |
+| `type` | string | Yes | Built-in ElastAlert rule type: any, blacklist, whitelist, change, frequency, spike, flatline, new_term, cardinality, metric_aggregation, spike_aggregation, percentage_match |
 | `index` | string | Yes | OpenSearch/Elasticsearch index pattern |
 | `filter` | list | No | List of filter clauses for the query |
 | `timeframe` | object | No | Time window for rule evaluation (e.g., `{minutes: 5}`, `{hours: 1}`, `{days: 2}`) |
@@ -385,78 +434,65 @@ spec:
 | `realert` | object | No | Minimum time between alerts |
 | `exponential_realert` | object | No | Exponential backoff for realerting |
 | `include` | list | No | List of fields to include in alerts |
-| `opsgenie_key` | string | No | Opsgenie API key |
+| `opsgenie_key` | string | No | Opsgenie API key (prefer `secretRefs`) |
 | `opsgenie_message` | string | No | Opsgenie alert message |
 | `opsgenie_priority` | string | No | Opsgenie alert priority (P1-P5) |
 | `opsgenie_tags` | list | No | Tags to add to Opsgenie alerts |
 | `opsgenie_teams` | list | No | Opsgenie teams to notify |
 | `http_post_url` | string | No | URL to POST alerts to (for HTTP POST alerter) |
 | `http_post_payload` | object | No | Payload structure for HTTP POST alerts |
-| `http_post_headers` | object | No | Headers for HTTP POST alerts |
+| `http_post_headers` | object | No | Headers for HTTP POST alerts (prefer `secretRefs` for tokens) |
 | `buffer_time` | object | No | Time buffer for queries (percentage_match, metric aggregation) |
 | `bucket_interval` | object | No | Time bucket interval for percentage calculation (percentage_match) |
 | `min_denominator` | integer | No | Minimum number of documents for percentage calculation (percentage_match) |
 | `min_percentage` | integer | No | Minimum percentage threshold to trigger alert (percentage_match) |
 | `match_bucket_filter` | list | No | Filter for the match bucket in percentage calculations (percentage_match) |
 | `fields` | list | No | List of fields to monitor (new_term rules) |
-| `name` | string | No | Rule name (defaults to CR name) |
-| `targetConfigMap.name` | string | No | Target ConfigMap name (default: "elastalert-rules") |
-| `targetConfigMap.namespace` | string | No | Target ConfigMap namespace (default: CR namespace) |
-| `keyName` | string | No | ConfigMap key name (default: "\<name\>.yaml") |
-| `additionalFields` | object | No | Any other ElastAlert fields not explicitly defined above |
+| `name` | string | No | ElastAlert rule name (default: `<namespace>-<name>`) |
+| `targetConfigMap.name` | string | No | Target name (default: "elastalert-rules") |
+| `targetConfigMap.namespace` | string | No | Target namespace (default: CR namespace) |
+| `targetConfigMap.kind` | string | No | `ConfigMap` (default) or `Secret`. The whole `targetConfigMap` block is immutable |
+| `keyName` | string | No | Target key name, must end in `.yaml` or `.yml` (default: `<namespace>_<name>.yaml`) |
+| `secretRefs` | list | No | Fields filled from labelled Secrets: `field`, `name`, `key`, `format` (`string` or `yaml`). Requires a Secret target |
+| `additionalFields` | object | No | Other ElastAlert settings from the operator's allowed list. Keys that clash with spec fields or are not allowed are rejected |
 
 ### ElastAlertRuleStatus
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `conditions` | []Condition | Status conditions (Ready, ValidationFailed, Error) |
-| `observedConfigMapResourceVersion` | string | Last observed ConfigMap resource version |
-| `lastReconciled` | timestamp | Timestamp of last successful reconciliation |
+| `conditions` | []Condition | Status conditions |
+| `observedGeneration` | integer | Generation the conditions were computed from |
+| `ruleChecksum` | string | SHA-256 of the rule last written to the target |
+| `lastReconciled` | timestamp | When the written rule last changed |
 
 ### Supported Condition Types
 
-- **Ready**: Rule successfully written to ConfigMap
-- **ValidationFailed**: Rule spec validation failed
-- **Error**: Error occurred during reconciliation
+- **Ready**: Rule successfully written to the target
+- **ValidationFailed**: Rejected by validation or policy. Reasons: `ValidationFailed`, `TargetNotAllowed`, `PolicyViolation`, `DuplicateRuleName`, `RenderFailed`
+- **Error**: Failure while writing. Reasons: `TargetNotFound`, `KeyConflict`, `SecretRefFailed`, `ReconciliationFailed`
+- **PlaintextCredentials**: The spec carries credentials inline
 
 ## Configuration
 
-### Environment Variables
+### Operator Flags
 
-The operator supports optional environment variables for triggering ElastAlert deployment rollouts:
+The Helm chart sets these from its values.
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `ELASTALERT_ROLLOUT_ENABLED` | Set to `"true"` to enable deployment rollouts | `true` |
-| `ELASTALERT_DEPLOYMENT_NAME` | Name of the ElastAlert deployment | `elastalert` |
-| `ELASTALERT_DEPLOYMENT_NAMESPACE` | Namespace of the ElastAlert deployment | `logging` |
+| Flag | Chart value | Description |
+|------|-------------|-------------|
+| `--allowed-targets` | `targets` (kind ConfigMap) | Comma separated `namespace/name` ConfigMaps rules may write to |
+| `--allowed-secret-targets` | `targets` (kind Secret) | Same for Secrets |
+| `--allowed-alerters` | `policy.allowedAlerters` | Alerters rules may use |
+| `--allowed-additional-fields` | `policy.allowedAdditionalFields` | Extra settings `additionalFields` and `secretRefs` may use |
+| `--allowed-index-patterns` | `policy.allowedIndexPatterns` | Glob patterns of indices rules may query (empty: any) |
+| `--allowed-http-hosts` | `policy.allowedHttpHosts` | Hosts every `*_url`, `*_urls` and `*_hosts` setting may use (empty: any) |
+| `--enable-secret-refs` | `secretRefs.enabled` | Allow `spec.secretRefs` |
+| `--secret-resync` | `secretRefs.resync` | How often rules with Secret dependencies are re-rendered (default 5m) |
+| `--elastalert-deployment` | `elastalert.*` | `namespace/name` of the ElastAlert Deployment to restart when rules change |
+| `--leader-elect` | always on | Leader election |
+| `--metrics-bind-address` | `metrics.*` | Authenticated HTTPS metrics endpoint |
 
-When `ELASTALERT_ROLLOUT_ENABLED` is `"true"` and both the deployment name and
-namespace are set, the operator will:
-1. Calculate a SHA256 checksum of all rule keys in the ConfigMap
-2. Update the deployment's pod template annotation `alerts.example.dev/rules-checksum`
-3. Trigger a rolling update when the checksum changes
-
-Example deployment configuration:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: elastalert-rules-operator
-spec:
-  template:
-    spec:
-      containers:
-      - name: manager
-        env:
-        - name: ELASTALERT_ROLLOUT_ENABLED
-          value: "true"
-        - name: ELASTALERT_DEPLOYMENT_NAME
-          value: "elastalert"
-        - name: ELASTALERT_DEPLOYMENT_NAMESPACE
-          value: "logging"
-```
+With rollouts enabled the operator calculates a SHA-256 checksum of the target and patches the Deployment's pod template annotation `alerts.example.dev/rules-checksum`, which triggers a rolling update when it changes.
 
 ## Development
 
@@ -584,7 +620,12 @@ kubectl get elastalertrule <name> -n <namespace> -o jsonpath='{.status.condition
 
 3. Check RBAC permissions:
    ```bash
-   kubectl auth can-i update configmaps --as=system:serviceaccount:elastalert-rules-operator-system:elastalert-rules-operator
+   kubectl auth can-i patch configmaps/elastalert-rules -n logging --as=system:serviceaccount:elastalert-rules-operator-system:elastalert-rules-operator
+   ```
+
+4. A `KeyConflict` means another rule or user owns the key. List the owners:
+   ```bash
+   kubectl get configmap <configmap-name> -n <namespace> --show-managed-fields -o yaml
    ```
 
 ### Validation Errors
@@ -594,8 +635,10 @@ Common validation errors:
 - **Missing required field**: Ensure `type` and `index` are specified
 - **Invalid timeframe**: Use Go duration format (e.g., "5m", "1h")
 - **Invalid numEvents**: Must be >= 1 for frequency rules
-- **Path separator in keyName**: KeyName cannot contain "/"
-- **ConfigMap does not exist**: Create the target ConfigMap before creating the ElastAlertRule
+- **Bad keyName**: Must match `^[-._a-zA-Z0-9]+\.ya?ml$`
+- **TargetNotAllowed**: Add the target to the chart's `targets` value
+- **PolicyViolation**: The alerter, index, host or additional field is not allowed
+- **Target does not exist**: Create the target before creating the ElastAlertRule
 
 ## Examples
 
@@ -607,7 +650,7 @@ The examples above demonstrate the various rule types and configurations support
 2. Create a feature branch
 3. Make your changes
 4. Add tests
-5. Run `make test` and `make manifests`
+5. Run `make test`, `make lint` and `make manifests`
 6. Submit a pull request
 
 ## License
@@ -628,12 +671,9 @@ limitations under the License.
 
 ## Roadmap
 
-- [ ] Webhook validation
-- [ ] Metrics and alerting for operator health
-- [ ] Support for ElastAlert 2.x
+- [ ] Operator health alerts and dashboards
+- [ ] Validating admission webhook for policy checks at admission time
 - [ ] Multi-cluster support
-- [ ] Helm chart for operator deployment
-- [ ] Advanced alert routing configurations
 
 ## Support
 

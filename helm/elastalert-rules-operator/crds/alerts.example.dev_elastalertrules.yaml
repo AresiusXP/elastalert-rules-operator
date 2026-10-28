@@ -55,8 +55,9 @@ spec:
             description: spec defines the desired state of ElastAlertRule
             properties:
               additionalFields:
-                description: AdditionalFields allows specifying any other ElastAlert
-                  fields not explicitly defined above
+                description: |-
+                  AdditionalFields allows specifying any other ElastAlert fields not explicitly defined above.
+                  Keys that conflict with spec fields or are blocked by the operator policy are rejected
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               alert:
@@ -122,8 +123,9 @@ spec:
                 minLength: 1
                 type: string
               keyName:
-                description: KeyName is the ConfigMap key name. Defaults to "<name>.yaml"
-                pattern: ^[^/]+$
+                description: KeyName is the target key name. Defaults to "<namespace>_<name>.yaml"
+                maxLength: 253
+                pattern: ^[-._a-zA-Z0-9]+\.ya?ml$
                 type: string
               match_bucket_filter:
                 description: MatchBucketFilter defines the filter for the match bucket
@@ -140,6 +142,8 @@ spec:
               min_percentage:
                 description: MinPercentage is the minimum percentage threshold to
                   trigger alert (percentage_match rules)
+                maximum: 100
+                minimum: 0
                 type: integer
               name:
                 description: Name is the rule name (optional, defaults to <name>)
@@ -175,18 +179,75 @@ spec:
                 description: Realert defines the minimum time between alerts
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              secretRefs:
+                description: SecretRefs inject rule fields from Secrets so credentials
+                  stay out of the resource
+                items:
+                  description: |-
+                    SecretRef injects the value of a Secret key into a top-level rule field.
+                    The Secret must be in the rule namespace and carry the label
+                    alerts.example.dev/allow-source=true.
+                  properties:
+                    field:
+                      description: Field is the top-level ElastAlert field to set
+                        (e.g. opsgenie_key, http_post_headers)
+                      maxLength: 63
+                      pattern: ^[a-z][a-z0-9_]*$
+                      type: string
+                    format:
+                      default: string
+                      description: 'Format of the value: "string" uses it as is, "yaml"
+                        parses it into a structured value'
+                      enum:
+                      - string
+                      - yaml
+                      type: string
+                    key:
+                      description: Key within the Secret
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    name:
+                      description: Name of the Secret
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                  required:
+                  - field
+                  - key
+                  - name
+                  type: object
+                maxItems: 20
+                type: array
+                x-kubernetes-list-type: atomic
               targetConfigMap:
-                description: TargetConfigMap specifies where to write the rule
+                default: {}
+                description: TargetConfigMap specifies where to write the rule. It
+                  cannot be changed after creation
                 properties:
+                  kind:
+                    default: ConfigMap
+                    description: Kind of the target object. Rules that use secretRefs
+                      must target a Secret
+                    enum:
+                    - ConfigMap
+                    - Secret
+                    type: string
                   name:
                     default: elastalert-rules
-                    description: Name of the target ConfigMap
+                    description: Name of the target object
+                    maxLength: 253
                     type: string
                   namespace:
-                    description: Namespace of the target ConfigMap. Defaults to the
-                      CR namespace if not specified
+                    description: Namespace of the target object. Defaults to the CR
+                      namespace if not specified
+                    maxLength: 63
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: targetConfigMap is immutable; delete and recreate the rule
+                    to move it
+                  rule: self == oldSelf
               timeframe:
                 description: |-
                   Timeframe is the time window for rule evaluation
@@ -194,14 +255,33 @@ spec:
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
               type:
-                description: Type is the ElastAlert rule type (e.g., "frequency",
-                  "any", "spike", "flatline", "new_term", "cardinality")
-                minLength: 1
+                description: Type is the ElastAlert built-in rule type
+                enum:
+                - any
+                - blacklist
+                - whitelist
+                - change
+                - frequency
+                - spike
+                - flatline
+                - new_term
+                - cardinality
+                - metric_aggregation
+                - spike_aggregation
+                - percentage_match
                 type: string
             required:
             - index
             - type
             type: object
+            x-kubernetes-validations:
+            - message: num_events is required for frequency rules
+              rule: self.type != 'frequency' || has(self.num_events)
+            - message: rules that use secretRefs must set targetConfigMap.kind to
+                Secret
+              rule: '!has(self.secretRefs) || size(self.secretRefs) == 0 || (has(self.targetConfigMap)
+                && has(self.targetConfigMap.kind) && self.targetConfigMap.kind ==
+                ''Secret'')'
           status:
             description: status defines the observed state of ElastAlertRule
             properties:
@@ -267,13 +347,18 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               lastReconciled:
-                description: LastReconciled is the timestamp of the last successful
-                  reconciliation
+                description: LastReconciled is the timestamp of the last time the
+                  written rule changed
                 format: date-time
                 type: string
-              observedConfigMapResourceVersion:
-                description: ObservedConfigMapResourceVersion is the last observed
-                  resource version of the target ConfigMap
+              observedGeneration:
+                description: ObservedGeneration is the generation the conditions were
+                  computed from
+                format: int64
+                type: integer
+              ruleChecksum:
+                description: RuleChecksum is the SHA-256 of the rendered rule last
+                  written to the target
                 type: string
             type: object
         required:

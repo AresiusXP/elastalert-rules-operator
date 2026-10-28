@@ -48,7 +48,7 @@ func TestToElastAlertYAMLBasic(t *testing.T) {
 
 	// Check required fields
 	requiredFields := []string{
-		"name: test-rule",
+		"name: default-test-rule",
 		"type: frequency",
 		"index: logs-*",
 		"num_events: 10",
@@ -468,7 +468,7 @@ func TestGetKeyName(t *testing.T) {
 			name:     "default key name",
 			ruleName: "my-rule",
 			keyName:  "",
-			want:     "my-rule.yaml",
+			want:     "team-a_my-rule.yaml",
 		},
 		{
 			name:     "custom key name",
@@ -482,7 +482,8 @@ func TestGetKeyName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			rule := &ElastAlertRule{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: tt.ruleName,
+					Name:      tt.ruleName,
+					Namespace: "team-a",
 				},
 				Spec: ElastAlertRuleSpec{
 					KeyName: tt.keyName,
@@ -507,7 +508,7 @@ func TestGetRuleName(t *testing.T) {
 			name:     "default rule name",
 			crName:   "my-rule",
 			specName: "",
-			want:     "my-rule",
+			want:     "team-a-my-rule",
 		},
 		{
 			name:     "custom rule name in spec",
@@ -521,7 +522,8 @@ func TestGetRuleName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			rule := &ElastAlertRule{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: tt.crName,
+					Name:      tt.crName,
+					Namespace: "team-a",
 				},
 				Spec: ElastAlertRuleSpec{
 					Name: tt.specName,

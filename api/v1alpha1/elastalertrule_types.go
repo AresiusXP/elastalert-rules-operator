@@ -24,24 +24,67 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
-// TargetConfigMap defines the ConfigMap where the ElastAlert rule should be written
+// Target kinds supported for TargetConfigMap.Kind.
+const (
+	TargetKindConfigMap = "ConfigMap"
+	TargetKindSecret    = "Secret"
+)
+
+// TargetConfigMap defines the ConfigMap or Secret where the ElastAlert rule is written.
+// The operator only writes to targets on its allowlist.
 type TargetConfigMap struct {
-	// Name of the target ConfigMap
+	// Name of the target object
 	// +kubebuilder:default="elastalert-rules"
+	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	Name string `json:"name,omitempty"`
 
-	// Namespace of the target ConfigMap. Defaults to the CR namespace if not specified
+	// Namespace of the target object. Defaults to the CR namespace if not specified
+	// +kubebuilder:validation:MaxLength=63
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
+
+	// Kind of the target object. Rules that use secretRefs must target a Secret
+	// +kubebuilder:validation:Enum=ConfigMap;Secret
+	// +kubebuilder:default=ConfigMap
+	// +optional
+	Kind string `json:"kind,omitempty"`
+}
+
+// SecretRef injects the value of a Secret key into a top-level rule field.
+// The Secret must be in the rule namespace and carry the label
+// alerts.example.dev/allow-source=true.
+type SecretRef struct {
+	// Field is the top-level ElastAlert field to set (e.g. opsgenie_key, http_post_headers)
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9_]*$`
+	// +kubebuilder:validation:MaxLength=63
+	Field string `json:"field"`
+
+	// Name of the Secret
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
+
+	// Key within the Secret
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Key string `json:"key"`
+
+	// Format of the value: "string" uses it as is, "yaml" parses it into a structured value
+	// +kubebuilder:validation:Enum=string;yaml
+	// +kubebuilder:default=string
+	// +optional
+	Format string `json:"format,omitempty"`
 }
 
 // ElastAlertRuleSpec defines the desired state of ElastAlertRule
 // Fields are named to match ElastAlert's YAML format for consistency
+// +kubebuilder:validation:XValidation:rule="self.type != 'frequency' || has(self.num_events)",message="num_events is required for frequency rules"
+// +kubebuilder:validation:XValidation:rule="!has(self.secretRefs) || size(self.secretRefs) == 0 || (has(self.targetConfigMap) && has(self.targetConfigMap.kind) && self.targetConfigMap.kind == 'Secret')",message="rules that use secretRefs must set targetConfigMap.kind to Secret"
 type ElastAlertRuleSpec struct {
-	// Type is the ElastAlert rule type (e.g., "frequency", "any", "spike", "flatline", "new_term", "cardinality")
+	// Type is the ElastAlert built-in rule type
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Enum=any;blacklist;whitelist;change;frequency;spike;flatline;new_term;cardinality;metric_aggregation;spike_aggregation;percentage_match
 	Type string `json:"type"`
 
 	// Index is the OpenSearch/Elasticsearch index pattern to query
@@ -144,6 +187,8 @@ type ElastAlertRuleSpec struct {
 	MinDenominator *int `json:"min_denominator,omitempty"`
 
 	// MinPercentage is the minimum percentage threshold to trigger alert (percentage_match rules)
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
 	// +optional
 	MinPercentage *int `json:"min_percentage,omitempty"`
 
@@ -160,16 +205,26 @@ type ElastAlertRuleSpec struct {
 	// +optional
 	Name string `json:"name,omitempty"`
 
-	// TargetConfigMap specifies where to write the rule
+	// TargetConfigMap specifies where to write the rule. It cannot be changed after creation
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="targetConfigMap is immutable; delete and recreate the rule to move it"
+	// +kubebuilder:default={}
 	// +optional
 	TargetConfigMap TargetConfigMap `json:"targetConfigMap,omitempty"`
 
-	// KeyName is the ConfigMap key name. Defaults to "<name>.yaml"
-	// +kubebuilder:validation:Pattern=`^[^/]+$`
+	// KeyName is the target key name. Defaults to "<namespace>_<name>.yaml"
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+\.ya?ml$`
 	// +optional
 	KeyName string `json:"keyName,omitempty"`
 
-	// AdditionalFields allows specifying any other ElastAlert fields not explicitly defined above
+	// SecretRefs inject rule fields from Secrets so credentials stay out of the resource
+	// +kubebuilder:validation:MaxItems=20
+	// +listType=atomic
+	// +optional
+	SecretRefs []SecretRef `json:"secretRefs,omitempty"`
+
+	// AdditionalFields allows specifying any other ElastAlert fields not explicitly defined above.
+	// Keys that conflict with spec fields or are blocked by the operator policy are rejected
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Type=object
 	// +optional
@@ -184,13 +239,17 @@ type ElastAlertRuleStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// ObservedConfigMapResourceVersion is the last observed resource version of the target ConfigMap
-	// +optional
-	ObservedConfigMapResourceVersion string `json:"observedConfigMapResourceVersion,omitempty"`
-
-	// LastReconciled is the timestamp of the last successful reconciliation
+	// LastReconciled is the timestamp of the last time the written rule changed
 	// +optional
 	LastReconciled *metav1.Time `json:"lastReconciled,omitempty"`
+
+	// ObservedGeneration is the generation the conditions were computed from
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// RuleChecksum is the SHA-256 of the rendered rule last written to the target
+	// +optional
+	RuleChecksum string `json:"ruleChecksum,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -239,12 +298,22 @@ const (
 	ConditionTypeValidationFailed = "ValidationFailed"
 	// ConditionTypeError indicates an error occurred during reconciliation
 	ConditionTypeError = "Error"
+	// ConditionTypePlaintextCredentials indicates the spec carries credentials inline instead of via secretRefs
+	ConditionTypePlaintextCredentials = "PlaintextCredentials"
 )
 
 // Finalizer name
 const (
 	FinalizerName = "alerts.example.dev/finalizer"
 )
+
+// GetTargetKind returns the target kind, defaulting to ConfigMap
+func (r *ElastAlertRule) GetTargetKind() string {
+	if r.Spec.TargetConfigMap.Kind != "" {
+		return r.Spec.TargetConfigMap.Kind
+	}
+	return TargetKindConfigMap
+}
 
 // GetConfigMapName returns the target ConfigMap name, defaulting to "elastalert-rules"
 func (r *ElastAlertRule) GetConfigMapName() string {
@@ -262,18 +331,18 @@ func (r *ElastAlertRule) GetConfigMapNamespace() string {
 	return r.Namespace
 }
 
-// GetKeyName returns the ConfigMap key name, defaulting to "<name>.yaml"
+// GetKeyName returns the target key name, defaulting to "<namespace>_<name>.yaml"
 func (r *ElastAlertRule) GetKeyName() string {
 	if r.Spec.KeyName != "" {
 		return r.Spec.KeyName
 	}
-	return r.Name + ".yaml"
+	return r.Namespace + "_" + r.Name + ".yaml"
 }
 
-// GetRuleName returns the ElastAlert rule name, using spec.name if set, otherwise "<name>"
+// GetRuleName returns the ElastAlert rule name, using spec.name if set, otherwise "<namespace>-<name>"
 func (r *ElastAlertRule) GetRuleName() string {
 	if r.Spec.Name != "" {
 		return r.Spec.Name
 	}
-	return r.Name
+	return r.Namespace + "-" + r.Name
 }
