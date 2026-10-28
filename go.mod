@@ -1,6 +1,6 @@
 module github.com/AresiusXP/elastalert-rules-operator
 
-go 1.26.0
+go 1.27.3
 
 require (
 	github.com/onsi/ginkgo/v2 v2.33.1
